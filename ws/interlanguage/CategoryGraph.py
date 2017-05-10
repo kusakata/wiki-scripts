@@ -156,7 +156,7 @@ class CategoryGraph:
 
     def create_category(self, category):
         title = Title(self.api, category)
-        if title.iwprefix or title.namespace != "Category":
+        if title.iwprefix or title.namespace != "カテゴリ":
             raise ValueError("Invalid category name: [[{}]]".format(category))
         # normalize name
         category = title.fullpagename

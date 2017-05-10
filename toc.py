@@ -51,7 +51,7 @@ class BaseFormatter:
         self.category_names = category_names
         if alsoin is None:
             alsoin = {}
-        alsoin.setdefault("en", "also in")
+        alsoin.setdefault("en", "別カテゴリ:")
         self.alsoin = alsoin
 
     def format_also_in(self, parents, lang_tag):
@@ -331,7 +331,7 @@ class TableOfContents:
             else:
                 raise NotImplementedError("unknown output action: {}".format(self.cliargs.save))
 
-            roots = ["Category:{}".format(lang.langname_for_tag(c)) for c in columns]
+            roots = ["カテゴリ:目次" for c in columns]
             ff.format_root(roots)
             if len(roots) == 1:
                 for item in graph.walk(graph.subcats, roots[0]):
