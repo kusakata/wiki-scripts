@@ -267,7 +267,7 @@ class _UserStats:
     def _compose_table(self, rows, majorusersN, activeusersN, totalusersN):
         newtext = (self.INTRO).format(majorusersN, self.MINTOTEDITS,
                                 activeusersN, self.MINRECEDITS,
-                                "edits" if self.MINRECEDITS > 1 else "edit",
+                                "",
                                 self.DAYS, self.db_userprops.firstdate,
                                 self.db_userprops.lastdate, totalusersN)
         newtext += Wikitable.assemble(self.FIELDS_FORMAT, rows)
