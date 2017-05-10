@@ -53,7 +53,7 @@ class Statistics:
                     type=int, dest='us_days', metavar='N',
                     help='the time span in days (default: %(default)s)')
         usstats.add_argument('--us-min-tot-edits', action='store',
-                    default=1000, type=int, dest='us_mintotedits', metavar='N',
+                    default=5, type=int, dest='us_mintotedits', metavar='N',
                     help='minimum total edits for users with not enough '
                     'recent changes (default: %(default)s)')
         usstats.add_argument('--us-min-rec-edits', action='store',
