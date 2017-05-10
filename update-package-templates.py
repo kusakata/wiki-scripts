@@ -327,13 +327,13 @@ class PkgUpdater:
         # package not found, select appropriate hint
         replacedby = self.finder.find_replaces(pkgname, exact=False)
         if replacedby:
-            return "replaced by {{Pkg|%s}}" % replacedby.name
+            return "置換パッケージ: {{Pkg|%s}}" % replacedby.name
 
         # check AUR3 archive (aur-mirror.git)
         if self.finder.find_aur3_archive(pkgname):
             return "{{%s|%s}}" % (self._localized_template("aur-mirror", lang), pkgname.lower())
 
-        return "package not found"
+        return "パッケージが存在しません"
 
     def update_page(self, title, text):
         """
