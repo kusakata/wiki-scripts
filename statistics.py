@@ -155,51 +155,40 @@ class _UserStats:
     User statistics.
     """
     INTRO = """\n
-This table shows the {} users with at least {} edits in total, combined with \
-the {} users who made at least {} {} in the {} days between {} and {} (00:00 \
-UTC), for a total of {} users.
+以下の表では {} 人の合計 {} 回以上編集を行ったユーザー、および {} 人の {} {} 回以上の編集を {} 日以内に行ったユーザー ({} 〜 {})、あわせて {} 人のユーザーを表示しています。
 
-The meaning of the additional columns is:
+カラムの意味は以下の通りです:
 
-* '''Recent''' &mdash; the number of edits made in the past 30 days. Includes \
-only normal edits, not special actions such as moving a page.
-* '''Total''' &mdash; the total number of edits made since the registration. \
-Includes only normal edits (including deleted ones), special actions are not \
-counted.
-* '''Longest streak''' &mdash; the length of the longest recorded streak in \
-days. The details for the streak are provided as tooltips.
-* '''Current streak''' &mdash; the length of the last recorded streak in days. \
-The details for the streak are provided as tooltips.
-* '''Avg. (total)''' &mdash; the average of edits per day since the user's \
-registration, calculated as the total number of edits divided by the number of \
-days since the registration date until today.
-* '''Avg. (active)''' &mdash; the ''active'' average of edits per day between \
-the user's first and last edits, calculated as the total number of edits \
-divided by the number of days between the user's first and last edits.
+* '''最近''' &mdash; 過去30日間の編集回数。ページ移動などは含まず通常の編集だけがカウント対象。
+* '''合計''' &mdash; 合計編集回数。通常編集だけがカウント対象で（削除済みのページは含む）、特殊操作は計算外。
+* '''最長記録''' &mdash; 連続で編集を行った最長日数。ツールチップで達成期間が分かります。
+* '''現在記録''' &mdash; 現時点での連続編集記録。ツールチップで編集回数など確認できます。
+* '''平均 (合計)''' &mdash; 1日あたりの平均編集回数（ユーザー登録時からカウント）。合計編集回数を登録年月日からの経過日数で割った値と一致。
+* '''平均 (活動)''' &mdash; 1日あたりの平均編集回数（ユーザーが初めて編集を行った日から最後に編集を行った日までのみカウント）。合計編集回数を編集を行ったことがある日数で割った値と一致。
 
 """
     FIELDS = ("user", "registration", "groups", "recenteditcount", "editcount",
               "longest streak", "current streak", "totaleditsperday",
               "activeeditsperday")
-    FIELDS_FORMAT = ("User", "Registration", "Groups", "Recent", "Total",
-                     "Longest<br>streak", "Current<br>streak",
-                     "Avg.<br>(total)", "Avg.<br>(active)")
+    FIELDS_FORMAT = ("ユーザー", "登録日時", "グループ", "最近", "合計",
+                     "最長<br>記録", "現在<br>記録",
+                     "平均<br>(合計)", "平均<br>(活動)")
     GRPTRANSL = {
         "*": "",
         "autoconfirmed": "",
         "user": "",
         "checkuser": "",
-        "bureaucrat": "[[ArchWiki:Bureaucrats|bureaucrat]]",
-        "sysop": "[[ArchWiki:Administrators|administrator]]",
-        "maintainer": "[[ArchWiki:Maintainers|maintainer]]",
-        "bot": "[[ArchWiki:Bots|bot]]",
+        "bureaucrat": "[[ArchWiki:ビューロクラット|ビューロクラット]]",
+        "sysop": "[[ArchWiki:管理者|管理者]]",
+        "maintainer": "[[ArchWiki:メンテナ|メンテナ]]",
+        "bot": "[[ArchWiki:ボット|ボット]]",
     }
-    STREAK_FORMAT = '<span title="{length} days, from {start} to {end} ({editcount} edits)">{length}</span>'
+    STREAK_FORMAT = '<span title="{start} から {end} までの {length} 日間 (編集回数: {editcount})">{length}</span>'
     REGISTRATION_FORMAT = "%Y-%m-%d %H:%M:%S"
 
     def __init__(self, api, cache_dir, autopage, days, mintotedits, minrecedits):
         self.api = api
-        self.text = autopage.wikicode.get_sections(matches="User statistics",
+        self.text = autopage.wikicode.get_sections(matches="ユーザー統計",
                     flat=True, include_lead=False, include_headings=False)[0]
 
         self.DAYS = days
