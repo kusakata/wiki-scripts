@@ -286,7 +286,7 @@ class PkgUpdater:
 
         # AUR, Grp, Pkg templates all take exactly 1 parameter
         if len(template.params) != 1:
-            hint = "invalid number of template parameters"
+            hint = "テンプレートパラメータに問題があります"
 
         try:
             param = template.get(1).value
