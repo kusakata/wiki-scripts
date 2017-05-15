@@ -210,13 +210,13 @@ class TableOfContents:
         # TODO: maybe leave only the short option to forbid configurability in config file
         group.add_argument("-f", "--force", action="store_true",
                 help="try to update the page even if it was last saved in the same UTC day")
-        group.add_argument("--toc-languages", default="all", type=ws.config.argtype_comma_list_choices(["all"] + lang.get_internal_tags()),
+        group.add_argument("--toc-languages", default="en", type=ws.config.argtype_comma_list_choices(["all"] + lang.get_internal_tags()),
                 help="a comma-separated list of language tags whose ToC pages should be updated (default: %(default)s)")
-        group.add_argument("--toc-page", default="Table of contents",
+        group.add_argument("--toc-page", default="目次",
                 help="the page name on the wiki to fetch and update (the language suffix "
                      "is added automatically as necessary) (default: %(default)s)")
         # TODO: no idea how to forbid setting this globally in the config...
-        group.add_argument("--summary", default="automatic update",
+        group.add_argument("--summary", default="自動更新",
                 help="the edit summary to use when saving the page (default: %(default)s)")
 
     @classmethod

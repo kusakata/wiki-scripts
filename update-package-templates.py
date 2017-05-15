@@ -428,7 +428,7 @@ class PkgUpdater:
     def get_report_wikitext(self):
         report = ""
         for lang in sorted(self.log.keys()):
-            report += "\n== %s ==\n\n" % lang
+            report += "\n== %s ==\n\n" % 'パッケージのリンク切れ'
             pages = self.log[lang]
             for title in sorted(pages.keys()):
                 report += "* [[%s]]\n" % title
