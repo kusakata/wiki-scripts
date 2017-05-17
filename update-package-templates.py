@@ -170,7 +170,7 @@ class PkgFinder:
 
 class PkgUpdater:
 
-    edit_summary = "update Pkg/AUR templates"
+    edit_summary = "Pkg/AUR テンプレートの更新"
 
     # titles of pages that should not be processed
     blacklist_pages = [
