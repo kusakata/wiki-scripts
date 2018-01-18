@@ -5,7 +5,9 @@ import itertools
 from .base_enc import *
 from .containers import *
 from .datetime_ import *
+from .json import *
 from .lazy import *
+from .OrderedSet import *
 from .rate import *
 
 # test if given string is ASCII

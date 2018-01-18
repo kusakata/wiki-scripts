@@ -1,47 +1,44 @@
 #!/usr/bin/env python3
 
-import logging
-
-from sqlalchemy import bindparam
+import sqlalchemy as sa
 
 import ws.utils
-from ws.parser_helpers.title import Title
 from ws.client.api import ShortRecentChangesError
-import ws.db.selects.recentchanges as rc
+import ws.db.selects as selects
 
-from . import Grabber
+from .GrabberBase import *
 
-logger = logging.getLogger(__name__)
-
-class GrabberProtectedTitles(Grabber):
+class GrabberProtectedTitles(GrabberBase):
 
     INSERT_PREDELETE_TABLES = ["protected_titles"]
 
     def __init__(self, api, db):
         super().__init__(api, db)
 
+        ins_pt = sa.dialects.postgresql.insert(db.protected_titles)
+
         self.sql = {
             ("insert", "protected_titles"):
-                db.protected_titles.insert(
-                    on_conflict_constraint=[
+                ins_pt.on_conflict_do_update(
+                    index_elements=[
                         db.protected_titles.c.pt_namespace,
                         db.protected_titles.c.pt_title,
                     ],
-                    on_conflict_update=[
-                        db.protected_titles.c.pt_level,
-                        db.protected_titles.c.pt_expiry,
-                    ]),
+                    set_={
+                        "pt_level":  ins_pt.excluded.pt_level,
+                        "pt_expiry": ins_pt.excluded.pt_expiry,
+                    }),
             ("delete", "protected_titles"):
                 db.protected_titles.delete().where(
-                    (db.protected_titles.c.pt_namespace == bindparam("b_pt_namespace")) &
-                    (db.protected_titles.c.pt_title == bindparam("b_pt_title"))),
+                    (db.protected_titles.c.pt_namespace == sa.bindparam("b_pt_namespace")) &
+                    (db.protected_titles.c.pt_title == sa.bindparam("b_pt_title"))),
         }
 
     def gen_inserts_from_pt_or_page(self, page):
         """
         :param page: an element from either titles=... or list=protectedtitles API query
         """
-        title = Title(self.api, page["title"])
+        title = self.db.Title(page["title"])
 
         if "protection" in page:
             # an element from titles=... query -> check if it's a protected title
@@ -68,7 +65,7 @@ class GrabberProtectedTitles(Grabber):
         # creating a page removes any corresponding rows from protected_titles
         # also delete rows for unprotected title
         if "missing" not in page or not page["protection"]:
-            title = Title(self.api, page["title"])
+            title = self.db.Title(page["title"])
             yield self.sql["delete", "protected_titles"], {"b_pt_namespace": title.namespacenumber, "b_pt_title": title.dbtitle()}
 
     def gen_insert(self):
@@ -92,7 +89,6 @@ class GrabberProtectedTitles(Grabber):
         # rare action so the query will always be short enough even with titles.
         # TODO: force POST only for this one query?
         if rctitles:
-            logger.info("Fetching {} protected titles...".format(len(rctitles)))
             for chunk in ws.utils.iter_chunks(rctitles, self.api.max_ids_per_query):
                 params = {
                     "action": "query",
@@ -107,35 +103,25 @@ class GrabberProtectedTitles(Grabber):
                     yield from self.gen_deletes_from_page(page)
 
     def get_rctitles(self, since):
-        since_f = ws.utils.format_date(since)
         rctitles = set()
 
         # Items in the recentchanges table are periodically purged according to
         # http://www.mediawiki.org/wiki/Manual:$wgRCMaxAge
-        # By default the max age is 13 weeks: if a larger timespan is requested
+        # By default the max age is 90 days: if a larger timespan is requested
         # here, it's very important to warn that the changes are not available
-#        if self.api.oldest_recent_change > since:
-        if rc.oldest_recent_change(self.db) > since:
+        if selects.oldest_rc_timestamp(self.db) > since:
             raise ShortRecentChangesError()
 
-#        rc_params = {
-#            "action": "query",
-#            "list": "recentchanges",
-#            "rctype": "new|log",
-#            "rcprop": "ids|title|loginfo",
-#            "rclimit": "max",
-#            "rcdir": "newer",
-#            "rcstart": since_f,
-#        }
-#        for change in self.api.list(rc_params):
         rc_params = {
+            "list": "recentchanges",
             "type": {"new", "log"},
             "prop": {"ids", "title", "loginfo"},
             "dir": "newer",
-            "start": since_f,
+            "start": since,
         }
-        for change in rc.list(self.db, rc_params):
+        for change in self.db.query(rc_params):
             if change["type"] == "log":
+                # note that pageid in recentchanges corresponds to log_page
                 if change["logtype"] == "protect" and change["pageid"] == 0:
                     rctitles.add(change["title"])
             elif change["type"] == "new":

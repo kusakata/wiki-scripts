@@ -5,17 +5,17 @@
 #   how hard is skipping code blocks?
 
 # TODO:
-#   skip category links, article status templates
 #   detect self-redirects (definitely interactive only)
 #   changes rejected interactively should be logged
 #   warn if the link leads to an archived page
-#   mark links with broken fragment with {{Broken fragment}}
 
 import difflib
 import re
 import logging
 import contextlib
+import datetime
 
+import requests
 import mwparserfromhell
 
 from ws.client import API, APIError
@@ -23,9 +23,10 @@ from ws.utils import LazyProperty
 import ws.cache
 import ws.utils
 from ws.interactive import edit_interactive, require_login, InteractiveQuit
+from ws.diff import diff_highlighted
 import ws.ArchWiki.lang as lang
-from ws.parser_helpers.encodings import dotencode
-from ws.parser_helpers.title import canonicalize, Title, InvalidTitleCharError
+from ws.parser_helpers.encodings import dotencode, queryencode
+from ws.parser_helpers.title import canonicalize, InvalidTitleCharError
 from ws.parser_helpers.wikicode import get_section_headings, get_anchors, ensure_flagged_by_template, ensure_unflagged_by_template
 
 logger = logging.getLogger(__name__)
@@ -223,6 +224,8 @@ class WikilinkRules:
                 self.db_copy[str(ns)] = self.db[str(ns)]
         self.db.dump()
 
+        self.void_update_cache = set()
+
     def check_trivial(self, wikilink):
         """
         Perform trivial simplification, replace `[[Foo|foo]]` with `[[foo]]`.
@@ -255,7 +258,7 @@ class WikilinkRules:
         # check if title is a redirect
         target = self.api.redirects.map.get(title.fullpagename)
         if target:
-            _title = Title(self.api, target)
+            _title = self.api.Title(target)
             _title.sectionname = title.sectionname
         else:
             _title = title
@@ -282,19 +285,19 @@ class WikilinkRules:
             return
 
         try:
-            text = Title(self.api, wikilink.text)
+            text = self.api.Title(wikilink.text)
         except InvalidTitleCharError:
             return
 
         target1 = self.api.redirects.map.get(title.fullpagename)
         target2 = self.api.redirects.map.get(text.fullpagename)
         if target1 is not None:
-            target1 = Title(self.api, target1)
+            target1 = self.api.Title(target1)
             # bail out if we lost the fragment
             if target1.sectionname != title.sectionname:
                 return
         if target2 is not None:
-            target2 = Title(self.api, target2)
+            target2 = self.api.Title(target2)
 
         if target1 is not None and target2 is not None:
             if target1 == target2:
@@ -379,7 +382,12 @@ class WikilinkRules:
 
         # skip if only the case of the first letter is different
         if wikilink.title[1:] != new[1:]:
+            first_letter = wikilink.title[0]
             wikilink.title = new
+            # preserve the case of the first letter if the rest differs only in spaces/underscores
+            # (e.g. don't replace [[environment_variables]] with [[Environment variables]])
+            if wikilink.title[1:].replace(" ", "_") == new[1:].replace(" ", "_"):
+                wikilink.title = first_letter + wikilink.title[1:]
             title.parse(wikilink.title)
 
     def check_anchor(self, wikilink, title, srcpage):
@@ -400,16 +408,12 @@ class WikilinkRules:
         if title.sectionname == "":
             return None
 
-        # FIXME: indecisive due to missing expansion of transclusions
-        if title.pagename.startswith("List of applications"):
-            return None
-
         # determine target page
         if title.fullpagename:
             _target_ns = title.namespacenumber
             _target_title = title.fullpagename
         else:
-            src_title = Title(self.api, srcpage)
+            src_title = self.api.Title(srcpage)
             _target_ns = src_title.namespacenumber
             _target_title = src_title.fullpagename
 
@@ -418,13 +422,18 @@ class WikilinkRules:
             return None
 
         # resolve redirects
+        anchor_on_redirect_to_section = False
         if _target_title in self.api.redirects.map:
-            _new_title = Title(self.api, self.api.redirects.resolve(_target_title))
+            _new_title = self.api.Title(self.api.redirects.resolve(_target_title))
             if _new_title.sectionname:
-                logger.warning("skipping {} (section fragment placed on a redirect to possibly different section)".format(wikilink))
-                return None
+                logger.warning("warning: section fragment placed on a redirect to possibly different section: {}".format(wikilink))
+                anchor_on_redirect_to_section = True
             _target_ns = _new_title.namespacenumber
             _target_title = _new_title.fullpagename
+
+        # FIXME: indecisive due to missing expansion of transclusions
+        if _target_title.startswith("List of applications"):
+            return None
 
         # lookup target page content
         # TODO: pulling revisions from cache does not expand templates
@@ -447,6 +456,13 @@ class WikilinkRules:
 
         anchor = dotencode(title.sectionname)
         needs_fix = True
+
+        # handle double-anchor redirects first
+        if anchor_on_redirect_to_section is True:
+            if anchor in anchors:
+                return True
+            else:
+                return False
 
         # try exact match first
         if anchor in anchors:
@@ -534,7 +550,11 @@ class WikilinkRules:
                 wikilink.title = wikilink.title.rstrip()
 
     def update_wikilink(self, wikicode, wikilink, src_title, summary_parts):
-        title = Title(self.api, wikilink.title)
+        if str(wikilink) in self.void_update_cache:
+            logger.debug("Skipping wikilink {} due to void-update cache.".format(wikilink))
+            return
+
+        title = self.api.Title(wikilink.title)
         # skip interlanguage links (handled by interlanguage.py)
         if title.iwprefix in self.api.site.interlanguagemap.keys():
             return
@@ -581,23 +601,109 @@ class WikilinkRules:
             # collapse whitespace around the link, e.g. 'foo [[ bar]]' -> 'foo [[bar]]'
             self.collapse_whitespace(wikicode, wikilink)
 
+        # cache context-less, correct wikilinks that don't need any update
+        if title.pagename and len(summary_parts) == 0 and anchor_result is True:
+            self.void_update_cache.add(str(wikilink))
 
-class LinkChecker(ExtlinkRules, WikilinkRules):
+
+class ManTemplateRules:
+    url_template = "http://jlk.fjfi.cvut.cz/arch/manpages/man/{pagename}.{section}"
+    url_template_nosection = "http://jlk.fjfi.cvut.cz/arch/manpages/man/{pagename}"
+
+    def __init__(self, timeout, max_retries):
+        self.timeout = timeout
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(max_retries=max_retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+        self.cache_valid_urls = set()
+        self.cache_invalid_urls = set()
+
+    def update_man_template(self, wikicode, template):
+        if template.name.lower() != "man":
+            return
+
+        now = datetime.datetime.utcnow()
+        deadlink_params = [now.year, now.month, now.day]
+        deadlink_params = ["{:02d}".format(i) for i in deadlink_params]
+
+        if not template.has(1) or not template.has(2, ignore_empty=True):
+            ensure_flagged_by_template(wikicode, template, "Dead link", *deadlink_params, overwrite_parameters=False)
+            return
+
+        if template.get(1).value.strip():
+            url = self.url_template.format(section=template.get(1).value.strip(), pagename=queryencode(template.get(2).value.strip()))
+        else:
+            url = self.url_template_nosection.format(pagename=queryencode(template.get(2).value.strip()))
+        if template.has(3):
+            url += "#{}".format(queryencode(template.get(3).value.strip()))
+        if template.has("url"):
+            explicit_url = template.get("url").value.strip()
+        else:
+            explicit_url = None
+
+        def check_url(url):
+            if url.startswith("ftp://"):
+                logger.error("The FTP protocol is not supported by the requests module. URL: {}".format(url))
+                return True
+            if url in self.cache_valid_urls:
+                return True
+            elif url in self.cache_invalid_urls:
+                return False
+            response = self.session.get(url, timeout=self.timeout)
+            if response.status_code == 200:
+                # heuristics to get the missing section (redirect from some_page to some_page.1)
+                # WARNING: if the manual exists in multiple sections, the first one might not be the best
+                if len(response.history) == 1 and response.url.startswith(url + "."):
+                    # template parameter 1= should be empty
+                    assert not template.has(1, ignore_empty=True)
+                    template.add(1, response.url[len(url) + 1:])
+                    self.cache_valid_urls.add(response.url)
+                    return True
+                else:
+                    self.cache_valid_urls.add(url)
+                    return True
+            elif response.status_code >= 400:
+                self.cache_invalid_urls.add(url)
+                return False
+            else:
+                raise NotImplementedError("Unexpected status code {} for man page URL: {}".format(response.status_code, url))
+
+        # check if the template parameters form a valid URL
+        if check_url(url):
+            ensure_unflagged_by_template(wikicode, template, "Dead link")
+            # remove explicit url= parameter - not necessary
+            if explicit_url is not None:
+                template.remove("url")
+        elif explicit_url is None:
+            ensure_flagged_by_template(wikicode, template, "Dead link", *deadlink_params, overwrite_parameters=False)
+        elif explicit_url != "":
+            if check_url(explicit_url):
+                ensure_unflagged_by_template(wikicode, template, "Dead link")
+            else:
+                ensure_flagged_by_template(wikicode, template, "Dead link", *deadlink_params, overwrite_parameters=False)
+
+
+class LinkChecker(ExtlinkRules, WikilinkRules, ManTemplateRules):
 
     skip_pages = ["Table of contents", "Help:Editing", "ArchWiki:Reports", "ArchWiki:Requests", "ArchWiki:Statistics"]
     # article status templates, lowercase
     skip_templates = ["accuracy", "archive", "bad translation", "expansion", "laptop style", "merge", "move", "out of date", "remove", "stub", "style", "translateme"]
 
-    def __init__(self, api, cache_dir, interactive=False, first=None, title=None, langnames=None):
-        # ensure that we are authenticated
-        require_login(api)
+    def __init__(self, api, cache_dir, interactive=False, dry_run=False, first=None, title=None, langnames=None, connection_timeout=30, max_retries=3):
+        if not dry_run:
+            # ensure that we are authenticated
+            require_login(api)
 
         # init inherited
         ExtlinkRules.__init__(self)
         WikilinkRules.__init__(self, api, cache_dir, interactive)
+        ManTemplateRules.__init__(self, connection_timeout, max_retries)
 
         self.api = api
         self.interactive = interactive
+        self.dry_run = dry_run
 
         # parameters for self.run()
         self.first = first
@@ -614,6 +720,8 @@ class LinkChecker(ExtlinkRules, WikilinkRules):
         group = argparser.add_argument_group(title="script parameters")
         group.add_argument("-i", "--interactive", action="store_true",
                 help="enables interactive mode")
+        group.add_argument("--dry-run", action="store_true",
+                help="enables dry-run mode (changes are only shown and discarded)")
         mode = group.add_mutually_exclusive_group()
         mode.add_argument("--first", default=None, metavar="TITLE",
                 help="the title of the first page to be processed")
@@ -635,7 +743,7 @@ class LinkChecker(ExtlinkRules, WikilinkRules):
             langnames = {lang.langname_for_tag(tag) for tag in tags}
         else:
             langnames = set()
-        return klass(api, args.cache_dir, interactive=args.interactive, first=args.first, title=args.title, langnames=langnames)
+        return klass(api, args.cache_dir, interactive=args.interactive, dry_run=args.dry_run, first=args.first, title=args.title, langnames=langnames, connection_timeout=args.connection_timeout, max_retries=args.connection_max_retries)
 
     def update_page(self, src_title, text):
         """
@@ -647,7 +755,7 @@ class LinkChecker(ExtlinkRules, WikilinkRules):
             and edit_summary is the description of performed changes
         """
         # FIXME: ideally "DeveloperWiki:" would be a proper namespace
-        if src_title in self.skip_pages or src_title.startswith("DeveloperWiki:"):
+        if lang.detect_language(src_title)[0] in self.skip_pages or src_title.startswith("DeveloperWiki:"):
             logger.info("Skipping blacklisted page [[{}]]".format(src_title))
             return text, ""
 
@@ -656,15 +764,15 @@ class LinkChecker(ExtlinkRules, WikilinkRules):
         wikicode = mwparserfromhell.parse(text, skip_style_tags=True)
         summary_parts = []
 
+        summary = get_edit_checker(wikicode, summary_parts)
+
         for extlink in wikicode.ifilter_external_links(recursive=True):
             # skip links inside article status templates
             parent = wikicode.get(wikicode.index(extlink, recursive=True))
             if isinstance(parent, mwparserfromhell.nodes.template.Template) and parent.name.lower() in self.skip_templates:
                 continue
-            self.update_extlink(wikicode, extlink)
-
-        if text != str(wikicode):
-            summary_parts.append("replaced external links")
+            with summary("replaced external links"):
+                self.update_extlink(wikicode, extlink)
 
         for wikilink in wikicode.ifilter_wikilinks(recursive=True):
             # skip links inside article status templates
@@ -672,6 +780,29 @@ class LinkChecker(ExtlinkRules, WikilinkRules):
             if isinstance(parent, mwparserfromhell.nodes.template.Template) and parent.name.lower() in self.skip_templates:
                 continue
             self.update_wikilink(wikicode, wikilink, src_title, summary_parts)
+
+        for template in wikicode.ifilter_templates(recursive=True):
+            # skip templates that may be added or removed
+            if str(template.name) in {"Broken section link", "Dead link"}:
+                continue
+            # skip links inside article status templates
+            parent = wikicode.get(wikicode.index(template, recursive=True))
+            if isinstance(parent, mwparserfromhell.nodes.template.Template) and parent.name.lower() in self.skip_templates:
+                continue
+            _pure_template = lang.detect_language(str(template.name))[0]
+            if _pure_template.lower() in {"related", "related2"}:
+                target = template.get(1).value
+                # temporarily convert the {{Related}} to wikilink to reuse the update code
+                wl = mwparserfromhell.nodes.wikilink.Wikilink(target)
+                wikicode.replace(template, wl)
+                # update
+                self.update_wikilink(wikicode, wl, src_title, summary_parts)
+                # replace back
+                target.value = str(wl.title)
+                wikicode.replace(wl, template)
+            elif template.name.lower() == "man":
+                with summary("updated man page links"):
+                    self.update_man_template(wikicode, template)
 
         # deduplicate and keep order
         parts = set()
@@ -686,13 +817,19 @@ class LinkChecker(ExtlinkRules, WikilinkRules):
 
     def _edit(self, title, pageid, text_new, text_old, timestamp, edit_summary):
         if text_old != text_new:
-            try:
-                if self.interactive is False:
-                    self.api.edit(title, pageid, text_new, timestamp, edit_summary, bot="")
-                else:
-                    edit_interactive(self.api, title, pageid, text_old, text_new, timestamp, edit_summary, bot="")
-            except APIError as e:
-                pass
+            if self.dry_run:
+                diff = diff_highlighted(text_old, text_new, title + ".old", title + ".new", timestamp, "<utcnow>")
+                print(diff)
+                print("Edit summary:  " + edit_summary)
+                print("(edit discarded due to --dry-run)")
+            else:
+                try:
+                    if self.interactive is False:
+                        self.api.edit(title, pageid, text_new, timestamp, edit_summary, bot="")
+                    else:
+                        edit_interactive(self.api, title, pageid, text_old, text_new, timestamp, edit_summary, bot="")
+                except APIError as e:
+                    pass
 
     def process_page(self, title):
         result = self.api.call_api(action="query", prop="revisions", rvprop="content|timestamp", titles=title)
@@ -710,7 +847,7 @@ class LinkChecker(ExtlinkRules, WikilinkRules):
         # rewind to the right namespace (the API throws BadTitle error if the
         # namespace of apfrom does not match apnamespace)
         if apfrom is not None:
-            _title = Title(self.api, apfrom)
+            _title = self.api.Title(apfrom)
             if _title.namespacenumber not in namespaces:
                 logger.error("Valid namespaces for the --first option are {}.".format([self.api.site.namespaces[ns] for ns in namespaces]))
                 return

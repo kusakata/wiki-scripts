@@ -1,6 +1,5 @@
 pytest
 pytest-cov
-# FIXME: pytest-dbfixtures is a "metapackage", but apparently the components have to be specified manually
-#pytest-dbfixtures
-pytest-mysql
 pytest-postgresql
+pytest-nginx
+pytest-bdd

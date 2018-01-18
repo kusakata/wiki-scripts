@@ -3,16 +3,20 @@
 """
 Prerequisites:
 
-1. A pre-configured MySQL or PostgreSQL database backend with separate database
-   and account.
-2. One of the many drivers supported by sqlalchemy, e.g. pymysql or psycopg2.
+1. A pre-configured PostgreSQL database backend with separate database and user
+   account. The database should be created with the "C" collation, e.g. create
+   the database with
+   `createdb -E UNICODE -l C -T template0 -O username dbname`
+2. One of the many drivers supported by sqlalchemy, e.g. psycopg2.
 """
 
-from sqlalchemy import create_engine, MetaData, select
-from sqlalchemy.engine import Engine
-import sqlalchemy.event
+import os.path
 
-from . import schema
+import sqlalchemy as sa
+import alembic.config
+
+from . import schema, selects, grabbers
+from ..parser_helpers.title import Context, Title
 
 class Database:
     """
@@ -29,59 +33,26 @@ class Database:
         # limit for continuation
         self.chunk_size = 5000
 
-        if isinstance(engine_or_url, Engine):
+        if isinstance(engine_or_url, sa.engine.Engine):
             self.engine = engine_or_url
         else:
-            self.engine = create_engine(engine_or_url, echo=True, implicit_returning=False)
+            self.engine = sa.create_engine(engine_or_url, echo=False)
 
-        # connect event handler for the MySQL engine
-        # reference: http://docs.sqlalchemy.org/en/latest/core/events.html#sqlalchemy.events.PoolEvents
-        if self.engine.name == "mysql":
-            def listenerForMySQL(dbapi_con, connection_record, connection_proxy):
-                modes = [
-                    # Without this, MySQL will silently insert invalid values in the
-                    # database, causing very long debugging sessions in the long run
-                    # https://www.enricozini.org/blog/2012/tips/sa-sqlmode-traditional/
-                    "TRADITIONAL",
-                    # we want to be able to set 0 as an auto-increment ID
-                    # https://dev.mysql.com/doc/refman/5.7/en/sql-mode.html#sqlmode_no_auto_value_on_zero
-                    "NO_AUTO_VALUE_ON_ZERO",
-                ]
-                cur = dbapi_con.cursor()
-                cur.execute("SET SESSION sql_mode='{}'".format(",".join(modes)))
-            sqlalchemy.event.listen(self.engine, "checkout", listenerForMySQL)
+        assert self.engine.name == "postgresql"
 
-        # TODO: only for testing
-        metadata = MetaData(bind=self.engine)
-        metadata.reflect()
-        metadata.drop_all()
-
-        self.metadata = MetaData(bind=self.engine)
+        self.metadata = sa.MetaData(bind=self.engine)
         schema.create_tables(self.metadata)
 
-    @staticmethod
-    def make_url(dialect, driver, username, password, host, database, **kwargs):
-        """
-        :param str dialect: an SQL dialect, e.g. ``mysql`` or ``postgresql``
-        :param str driver: a driver for given SQL dialect supported by
-            :py:mod:`sqlalchemy`, e.g. ``pymysql`` or ``psycopg2``
-        :param str username: username for database connection
-        :param str password: password for database connection
-        :param str host: hostname of the database server
-        :param str database: database name
-        :param dict kwargs: additional parameters added to the query string part
-        """
-        if dialect == "mysql":
-            kwargs["charset"] = Database.charset
-        params = "&".join("{0}={1}".format(k, v) for k, v in kwargs.items())
-        return "{dialect}+{driver}://{username}:{password}@{host}/{database}?{params}" \
-               .format(dialect=dialect,
-                       driver=driver,
-                       username=username,
-                       password=password,
-                       host=host,
-                       database=database,
-                       params=params)
+        insp = sa.engine.reflection.Inspector.from_engine(self.engine)
+        if not insp.get_table_names():
+            # Empty database - create all tables from scratch and stamp the
+            # most recent alembic revision as "head". From now on the database
+            # will have to be migrated by alembic. From the cookbook:
+            # http://alembic.zzzcomputing.com/en/latest/cookbook.html#building-an-up-to-date-database-from-scratch
+            self.metadata.create_all()
+            cfg_path = os.path.join(os.path.dirname(__file__), "../..", "alembic.ini")
+            alembic_cfg = alembic.config.Config(cfg_path)
+            alembic.command.stamp(alembic_cfg, "head")
 
     @staticmethod
     def set_argparser(argparser):
@@ -95,7 +66,7 @@ class Database:
         """
         import ws.config
         group = argparser.add_argument_group(title="Database parameters")
-        group.add_argument("--db-dialect", metavar="DIALECT", choices=["mysql", "postgresql"],
+        group.add_argument("--db-dialect", metavar="DIALECT", choices=["postgresql"],
                 help="an SQL dialect (default: %(default)s)")
         group.add_argument("--db-driver", metavar="DRIVER",
                 help="a driver for given SQL dialect supported by sqlalchemy (default: %(default)s)")
@@ -105,6 +76,8 @@ class Database:
                 help="password for database connection (default: %(default)s)")
         group.add_argument("--db-host", metavar="HOST",
                 help="hostname of the database server (default: %(default)s)")
+        group.add_argument("--db-port", metavar="PORT",
+                help="port on which the database server listens (default: %(default)s)")
         group.add_argument("--db-name", metavar="DATABASE",
                 help="name of the database (default: %(default)s)")
 
@@ -119,7 +92,14 @@ class Database:
             contains the arguments set by :py:meth:`Connection.set_argparser`.
         :returns: an instance of :py:class:`Connection`
         """
-        url = klass.make_url(args.db_dialect, args.db_driver, args.db_user, args.db_password, args.db_host, args.db_name)
+        # The format is basically "{dialect}+{driver}://{username}:{password}@{host}:{port}/{database}?{params}",
+        # but the URL class is suitable for omitting empty defaults.
+        url = sa.engine.url.URL("{}+{}".format(args.db_dialect, args.db_driver),
+                                username=args.db_user,
+                                password=args.db_password,
+                                host=args.db_host,
+                                port=args.db_port,
+                                database=args.db_name)
         return klass(url)
 
     def __getattr__(self, table_name):
@@ -133,72 +113,64 @@ class Database:
             raise AttributeError("Table '{}' does not exist in the database.".format(table_name))
         return self.metadata.tables[table_name]
 
+    def sync_with_api(self, api, *, with_content=False):
+        """
+        Sync the local data with a remote MediaWiki instance.
 
-# Fix for DEFERRABLE foreign keys on MySQL,
-# see http://docs.sqlalchemy.org/en/latest/dialects/mysql.html#foreign-key-arguments-to-avoid
+        :param ws.client.api.API api: interface to the remote MediaWiki instance
+        :param bool with_content: whether to synchronize the content of all revisions
+        """
+        return grabbers.synchronize(self, api, with_content=with_content)
+
+    def query(self, *args, **kwargs):
+        """
+        Main interface for the MediaWiki-like database queries.
+
+        TODO: documentation of the parameters (or at least the differences from MediaWiki)
+        """
+        return selects.query(self, *args, **kwargs)
+
+    def Title(self, title):
+        """
+        Parse a MediaWiki title.
+
+        :param str title: page title to be parsed
+        :returns: a :py:class:`ws.parser_helpers.title.Title` object
+        """
+        iwmap = selects.get_interwikimap(self)
+        namespacenames = selects.get_namespacenames(self)
+        namespaces = selects.get_namespaces(self)
+        # legaltitlechars are not stored in the database, it will hardly ever
+        # change so let's just hardcode it
+        legaltitlechars = " %!\"$&'()*,\\-.\\/0-9:;=?@A-Z\\\\^_`a-z~\\x80-\\xFF+"
+        context = Context(iwmap, namespacenames, namespaces, legaltitlechars)
+        return Title(context, title)
+
+
+"""
+Profiling utilities. Explanation:
+https://www.postgresql.org/docs/current/static/using-explain.html
+
+Usage:
+
+>>> from ws.db.database import explain
+>>> for row in db.engine.execute(explain(s)):
+>>>     print(row[0])
+"""
+
+from sqlalchemy import *
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.schema import ForeignKeyConstraint
+from sqlalchemy.sql.expression import Executable, ClauseElement, _literal_as_text
 
-@compiles(ForeignKeyConstraint, "mysql")
-def process(element, compiler, **kw):
-    element.deferrable = element.initially = None
-    return compiler.visit_foreign_key_constraint(element, **kw)
+class explain(Executable, ClauseElement):
+    def __init__(self, stmt, analyze=False):
+        self.statement = _literal_as_text(stmt)
+        self.analyze = analyze
+        # helps with INSERT statements
+        self.inline = getattr(stmt, 'inline', None)
 
-
-from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.sql.expression import Insert
-
-@compiles(Insert, "mysql")
-def on_conflict_handler(insert, compiler, **kw):
-    """
-    An :py:mod:`sqlalchemy` compiler extension for the MySQL-specific
-    ``INSERT ... ON DUPLICATE KEY UPDATE`` clause.
-
-    This is our best chance at combining ``INSERT`` and ``UPDATE`` statements.
-    The standard `MERGE statement`_ is not supported with the standard syntax in
-    MySQL, SQLite and others.
-
-    Note that statements involving ``REPLACE`` are also nonstandard and invoke
-    referential actions on child rows (e.g. ``FOREIGN KEY ... ON DELETE CASCADE``).
-
-    .. _`MERGE statement`: https://en.wikipedia.org/wiki/Merge_(SQL)
-    """
-    if "on_conflict_update" in insert.kwargs:
-        s = compiler.visit_insert(insert, **kw)
-        columns = [c.name for c in insert.kwargs["on_conflict_update"]]
-        values = ", ".join("{0}=VALUES({0})".format(c) for c in columns)
-        return s + " ON DUPLICATE KEY UPDATE " + values
-    elif insert.kwargs.get("on_conflict_do_nothing") is True:
-        # INSERT IGNORE ...
-        return compiler.visit_insert(insert.prefix_with("IGNORE"), **kw)
-    return compiler.visit_insert(insert, **kw)
-# TODO: argument_for creates arguments like mysql_on_conflict_update, we need one name for all
-#Insert.argument_for("mysql", "on_conflict_update", None)
-#Insert.argument_for("mysql", "on_conflict_do_nothing", None)
-
-# FIXME: this always appends to the sqlalchemy's query, but we should insert the clause before the RETURNING clause:
-# https://www.postgresql.org/docs/current/static/sql-insert.html
-# (as a workaround we pass implicit_returning=False to create_engine to avoid the RETURNING clauses)
-# TODO: to fix the above, we could use sqlalchemy's on_conflict_do_{update,nothing} extensions and reimplement the wrappers for mysql:
-# http://docs.sqlalchemy.org/en/rel_1_1/dialects/postgresql.html?highlight=upsert#insert-on-conflict-upsert
-@compiles(Insert, "postgresql")
-def on_conflict_handler(insert, compiler, **kw):
-    """
-    https://www.postgresql.org/docs/current/static/sql-insert.html#SQL-ON-CONFLICT
-    """
-    s = compiler.visit_insert(insert, **kw)
-    if "on_conflict_update" in insert.kwargs:
-        # unlike MySQL, PostgreSQL 9.6 does not support "any" constraint
-        # http://stackoverflow.com/questions/35786354/postgres-upsert-on-any-constraint
-        assert "on_conflict_constraint" in insert.kwargs
-        constraint = ",".join(c.name for c in insert.kwargs["on_conflict_constraint"])
-        columns = [c.name for c in insert.kwargs["on_conflict_update"]]
-        values = ", ".join("{0}=excluded.{0}".format(c) for c in columns)
-        return s + " ON CONFLICT ({0}) DO UPDATE SET ".format(constraint) + values
-    elif insert.kwargs.get("on_conflict_do_nothing") is True:
-        return s + " ON CONFLICT DO NOTHING"
-    return s
-# TODO: argument_for creates arguments like postgresql_on_conflict_update, we need one name for all
-#Insert.argument_for("postgresql", "on_conflict_constraint", None)
-#Insert.argument_for("postgresql", "on_conflict_update", None)
-#Insert.argument_for("postgresql", "on_conflict_do_nothing", None)
+@compiles(explain)
+def visit_explain(element, compiler, **kw):
+    text = "EXPLAIN ANALYZE "
+    text += compiler.process(element.statement, **kw)
+    return text

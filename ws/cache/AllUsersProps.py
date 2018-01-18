@@ -90,7 +90,7 @@ class AllUsersProps(CacheDb):
 
         :returns: list of user names
         """
-        lestart = utils.format_date(self.timestamp)
+        lestart = self.timestamp
         users = []
         for letype in ["newusers", "rights", "block"]:
             for user in self.api.list(list="logevents", letype=letype, lelimit="max", ledir="newer", lestart=lestart):
@@ -112,9 +112,7 @@ class AllUsersProps(CacheDb):
             today = datetime.datetime(*(today.timetuple()[:3]))
         firstday = today - datetime.timedelta(days=self.active_days)
 
-        rcstart = utils.format_date(today)
-        rcend = utils.format_date(firstday)
-        rc = self.api.list(action="query", list="recentchanges", rctype="edit", rcprop="user|timestamp", rclimit="max", rcstart=rcstart, rcend=rcend)
+        rc = self.api.list(action="query", list="recentchanges", rctype="edit", rcprop="user|timestamp", rclimit="max", rcstart=today, rcend=firstday)
 
         rcusers = {}
         for change in rc:
@@ -125,9 +123,9 @@ class AllUsersProps(CacheDb):
 
         # Items in the recentchanges table are periodically purged according to
         # http://www.mediawiki.org/wiki/Manual:$wgRCMaxAge
-        # By default the max age is 13 weeks: if a larger timespan is requested
+        # By default the max age is 90 days: if a larger timespan is requested
         # here, it's very important to warn that the changes are not available
-        if self.api.oldest_recent_change > firstday:
+        if self.api.oldest_rc_timestamp > firstday:
             raise ShortRecentChangesError()
 
         # save as meta data, only when not raising

@@ -1,88 +1,138 @@
 #!/usr/bin/env python3
 
-import random
-import logging
-
-from sqlalchemy import bindparam
+import sqlalchemy as sa
 
 import ws.utils
-from ws.parser_helpers.title import Title
-from ws.client.api import ShortRecentChangesError
-import ws.db.selects.recentchanges as rc
+import ws.db.selects as selects
 
-from . import Grabber
+from .GrabberBase import *
 
-logger = logging.getLogger(__name__)
-
-class GrabberPages(Grabber):
+class GrabberPages(GrabberBase):
 
     INSERT_PREDELETE_TABLES = ["page", "page_props", "page_restrictions"]
 
     def __init__(self, api, db):
         super().__init__(api, db)
 
+        ins_page = sa.dialects.postgresql.insert(db.page)
+        ins_page_props = sa.dialects.postgresql.insert(db.page_props)
+        ins_page_restrictions = sa.dialects.postgresql.insert(db.page_restrictions)
+
         self.sql = {
             ("insert", "page"):
-                db.page.insert(
-                    on_conflict_constraint=[db.page.c.page_id],
-                    on_conflict_update=[
-                        db.page.c.page_namespace,
-                        db.page.c.page_title,
-                        db.page.c.page_is_redirect,
-                        db.page.c.page_is_new,
-                        db.page.c.page_random,
-                        db.page.c.page_touched,
-                        db.page.c.page_links_updated,
-                        db.page.c.page_latest,
-                        db.page.c.page_len,
-                        db.page.c.page_content_model,
-                        db.page.c.page_lang,
-                    ]),
+                ins_page.on_conflict_do_update(
+                    constraint=db.page.primary_key,
+                    set_={
+                        "page_namespace":     ins_page.excluded.page_namespace,
+                        "page_title":         ins_page.excluded.page_title,
+                        "page_is_redirect":   ins_page.excluded.page_is_redirect,
+                        "page_is_new":        ins_page.excluded.page_is_new,
+                        "page_touched":       ins_page.excluded.page_touched,
+                        "page_links_updated": ins_page.excluded.page_links_updated,
+                        "page_latest":        ins_page.excluded.page_latest,
+                        "page_len":           ins_page.excluded.page_len,
+                        "page_content_model": ins_page.excluded.page_content_model,
+                        "page_lang":          ins_page.excluded.page_lang,
+                    }),
             ("insert", "page_props"):
-                db.page_props.insert(
-                    on_conflict_constraint=[
+                ins_page_props.on_conflict_do_update(
+                    index_elements=[
                         db.page_props.c.pp_page,
                         db.page_props.c.pp_propname,
                     ],
-                    on_conflict_update=[
-                        db.page_props.c.pp_value,
-                    ]),
+                    set_={
+                        "pp_value": ins_page_props.excluded.pp_value,
+                    }),
             ("insert", "page_restrictions"):
-                db.page_restrictions.insert(
-                    on_conflict_constraint=[
+                ins_page_restrictions.on_conflict_do_update(
+                    index_elements=[
                         db.page_restrictions.c.pr_page,
                         db.page_restrictions.c.pr_type,
                     ],
-                    on_conflict_update=[
-                        db.page_restrictions.c.pr_level,
-                        db.page_restrictions.c.pr_cascade,
-                        db.page_restrictions.c.pr_user,
-                        db.page_restrictions.c.pr_expiry,
-                    ]),
+                    set_={
+                        "pr_level":   ins_page_restrictions.excluded.pr_level,
+                        "pr_cascade": ins_page_restrictions.excluded.pr_cascade,
+                        "pr_user":    ins_page_restrictions.excluded.pr_user,
+                        "pr_expiry":  ins_page_restrictions.excluded.pr_expiry,
+                    }),
             ("delete", "page"):
-                db.page.delete().where(db.page.c.page_id == bindparam("b_page_id")),
+                db.page.delete().where(db.page.c.page_id == sa.bindparam("b_page_id")),
             ("delete-but-one", "page_props"):
                 db.page_props.delete().where(
-                    (db.page_props.c.pp_page == bindparam("b_pp_page")) &
-                    (db.page_props.c.pp_propname != bindparam("b_pp_propname"))),
+                    (db.page_props.c.pp_page == sa.bindparam("b_pp_page")) &
+                    (db.page_props.c.pp_propname != sa.bindparam("b_pp_propname"))),
             ("delete-all", "page_props"):
                 db.page_props.delete().where(
-                    db.page_props.c.pp_page == bindparam("b_pp_page")),
+                    db.page_props.c.pp_page == sa.bindparam("b_pp_page")),
             ("delete-but-one", "page_restrictions"):
                 db.page_restrictions.delete().where(
-                    (db.page_restrictions.c.pr_page == bindparam("b_pr_page")) &
-                    (db.page_restrictions.c.pr_type != bindparam("b_pr_type"))),
+                    (db.page_restrictions.c.pr_page == sa.bindparam("b_pr_page")) &
+                    (db.page_restrictions.c.pr_type != sa.bindparam("b_pr_type"))),
             ("delete-all", "page_restrictions"):
                 db.page_restrictions.delete().where(
-                    db.page_restrictions.c.pr_page == bindparam("b_pr_page")),
+                    db.page_restrictions.c.pr_page == sa.bindparam("b_pr_page")),
+            ("delete", "deleted_recentchanges"):
+                db.recentchanges.delete().where(
+                    sa.and_(db.recentchanges.c.rc_logid == None,
+                            db.recentchanges.c.rc_cur_id.notin_(sa.select([db.page.c.page_id]))
+                    )),
         }
+
+        # build query to move data from the revision table into archive
+        deleted_revision = db.revision.delete() \
+            .where(db.revision.c.rev_page == sa.bindparam("b_rev_page")) \
+            .returning(*db.revision.c._all_columns) \
+            .cte("deleted_revision")
+        columns = [
+                db.page.c.page_namespace,
+                db.page.c.page_title,
+                deleted_revision.c.rev_id,
+                deleted_revision.c.rev_page,
+                deleted_revision.c.rev_text_id,
+                deleted_revision.c.rev_comment,
+                deleted_revision.c.rev_user,
+                deleted_revision.c.rev_user_text,
+                deleted_revision.c.rev_timestamp,
+                deleted_revision.c.rev_minor_edit,
+                deleted_revision.c.rev_deleted,
+                deleted_revision.c.rev_len,
+                deleted_revision.c.rev_parent_id,
+                deleted_revision.c.rev_sha1,
+                deleted_revision.c.rev_content_model,
+                deleted_revision.c.rev_content_format,
+            ]
+        select = sa.select(columns).select_from(
+                deleted_revision.join(db.page, deleted_revision.c.rev_page == db.page.c.page_id)
+            )
+        insert = db.archive.insert().from_select(
+            # populate all columns except ar_id
+            db.archive.c._all_columns[1:],
+            select
+        )
+        self.sql["move", "revision"] = insert
+
+        # build query to move data from the tagged_revision table into tagged_archived_revision
+        deleted_tagged_revision = db.tagged_revision.delete() \
+            .where(db.tagged_revision.c.tgrev_rev_id.in_(
+                        sa.select([db.revision.c.rev_id]) \
+                            .select_from(db.revision) \
+                            .where(db.revision.c.rev_page == sa.bindparam("b_rev_page"))
+                        )
+                    ) \
+            .returning(*db.tagged_revision.c._all_columns) \
+            .cte("deleted_tagged_revision")
+        insert = db.tagged_archived_revision.insert().from_select(
+            db.tagged_archived_revision.c._all_columns,
+            deleted_tagged_revision.select()
+        )
+        self.sql["move", "tagged_revision"] = insert
 
 
     def gen_inserts_from_page(self, page):
         if "missing" in page:
             raise StopIteration
 
-        title = Title(self.api, page["title"])
+        title = self.db.Title(page["title"])
 
         # items for page table
         db_entry = {
@@ -94,7 +144,6 @@ class GrabberPages(Grabber):
             # this field means that the page has only one revision or has not been edited since
             # being restored - see https://www.mediawiki.org/wiki/Manual:Page_table#page_is_new
             "page_is_new": "new" in page,
-            "page_random": random.random(),
             "page_touched": page["touched"],
             "page_links_updated": None,
             "page_latest": page["lastrevid"],
@@ -132,41 +181,40 @@ class GrabberPages(Grabber):
 
     def gen_deletes_from_page(self, page):
         if "missing" in page:
-            # deleted page - this will cause cascade deletion in
-            # page_props and page_restrictions tables
-            yield self.sql["delete", "page"], {"b_page_id": page["pageid"]}
-        else:
-            # delete outdated props
-            props = set(page.get("pageprops", {}))
-            if props:
-                if len(props) == 1:
-                    # optimized query using != instead of notin_
-                    yield self.sql["delete-but-one", "page_props"], {"b_pp_page": page["pageid"], "b_pp_propname": props.pop()}
-                else:
-                    # we need to check a tuple of arbitrary length (i.e. the props to keep),
-                    # so the queries can't be grouped
-                    yield self.db.page_props.delete().where(
-                            (self.db.page_props.c.pp_page == page["pageid"]) &
-                            self.db.page_props.c.pp_propname.notin_(props))
-            else:
-                # no props present - delete all rows with the pageid
-                yield self.sql["delete-all", "page_props"], {"b_pp_page": page["pageid"]}
+            # "missing" pages don't even have pageid, so there is nothing to do
+            return
 
-            # delete outdated restrictions
-            applied = set(pr["type"] for pr in page["protection"])
-            if applied:
-                if len(applied) == 1:
-                    # optimized query using != instead of notin_
-                    yield self.sql["delete-but-one", "page_restrictions"], {"b_pr_page": page["pageid"], "b_pr_type": applied.pop()}
-                else:
-                    # we need to check a tuple of arbitrary length (i.e. the restrictions
-                    # to keep), so the queries can't be grouped
-                    yield self.db.page_restrictions.delete().where(
-                            (self.db.page_restrictions.c.pr_page == page["pageid"]) &
-                            self.db.page_restrictions.c.pr_type.notin_(applied))
+        # delete outdated props
+        props = set(page.get("pageprops", {}))
+        if props:
+            if len(props) == 1:
+                # optimized query using != instead of notin_
+                yield self.sql["delete-but-one", "page_props"], {"b_pp_page": page["pageid"], "b_pp_propname": props.pop()}
             else:
-                # no restrictions applied - delete all rows with the pageid
-                yield self.sql["delete-all", "page_restrictions"], {"b_pr_page": page["pageid"]}
+                # we need to check a tuple of arbitrary length (i.e. the props to keep),
+                # so the queries can't be grouped
+                yield self.db.page_props.delete().where(
+                        (self.db.page_props.c.pp_page == page["pageid"]) &
+                        self.db.page_props.c.pp_propname.notin_(props))
+        else:
+            # no props present - delete all rows with the pageid
+            yield self.sql["delete-all", "page_props"], {"b_pp_page": page["pageid"]}
+
+        # delete outdated restrictions
+        applied = set(pr["type"] for pr in page["protection"])
+        if applied:
+            if len(applied) == 1:
+                # optimized query using != instead of notin_
+                yield self.sql["delete-but-one", "page_restrictions"], {"b_pr_page": page["pageid"], "b_pr_type": applied.pop()}
+            else:
+                # we need to check a tuple of arbitrary length (i.e. the restrictions
+                # to keep), so the queries can't be grouped
+                yield self.db.page_restrictions.delete().where(
+                        (self.db.page_restrictions.c.pr_page == page["pageid"]) &
+                        self.db.page_restrictions.c.pr_type.notin_(applied))
+        else:
+            # no restrictions applied - delete all rows with the pageid
+            yield self.sql["delete-all", "page_restrictions"], {"b_pr_page": page["pageid"]}
 
 
     def gen_insert(self):
@@ -185,60 +233,118 @@ class GrabberPages(Grabber):
 
 
     def gen_update(self, since):
-        rcpages = self.get_rcpages(since)
-        if rcpages:
-            logger.info("Fetching properties of {} modified pages...".format(len(rcpages)))
-            for chunk in ws.utils.iter_chunks(rcpages, self.api.max_ids_per_query):
+        # Items in the recentchanges table are periodically purged according to
+        # http://www.mediawiki.org/wiki/Manual:$wgRCMaxAge
+        # By default the max age is 90 days: if a larger timespan is requested
+        # here, we need to look into the logging table instead of recentchanges.
+        rc_oldest = selects.oldest_rc_timestamp(self.db)
+        if rc_oldest is None or rc_oldest > since:
+            delete_early, pages = self.get_logpages(since)
+        else:
+            delete_early, pages = self.get_rcpages(since)
+        keys = list(pages.keys())
+
+        # Always delete beforehand, otherwise inserts might violate the
+        # page_namespace_title unique constraint (for example when an automatic
+        # or manual move-over-redirect has been made).
+        for pageid in delete_early:
+            # move tags first
+            yield self.sql["move", "tagged_revision"], {"b_rev_page": pageid}
+            # move relevant revisions from the revision table into archive
+            yield self.sql["move", "revision"], {"b_rev_page": pageid}
+            # deleted page - this will cause cascade deletion in
+            # page_props and page_restrictions tables
+            yield self.sql["delete", "page"], {"b_page_id": pageid}
+
+        if pages:
+            for chunk in ws.utils.iter_chunks(pages, self.api.max_ids_per_query):
                 params = {
                     "action": "query",
                     "pageids": "|".join(str(pageid) for pageid in chunk),
                     "prop": "info|pageprops",
                     "inprop": "protection",
                 }
-                for page in self.api.call_api(params)["pages"].values():
-                    yield from self.gen_inserts_from_page(page)
-                    yield from self.gen_deletes_from_page(page)
+                pages = list(self.api.call_api(params)["pages"].values())
 
+                # ordering of SQL inserts is important for moved pages, but MediaWiki does
+                # not return ordered results for the pageids= parameter
+                pages.sort(key=lambda page: keys.index(page["pageid"]))
+
+                for page in pages:
+                    # deletes first, otherwise edit + move over redirect would fail
+                    yield from self.gen_deletes_from_page(page)
+                    yield from self.gen_inserts_from_page(page)
+
+        # get_logpages does not include normal edits, so we need to go through list=allpages again
+        if rc_oldest is None or rc_oldest > since:
+            yield from self.gen_insert()
+
+        # delete recent changes whose pages were deleted
+        yield self.sql["delete", "deleted_recentchanges"]
 
     def get_rcpages(self, since):
-        since_f = ws.utils.format_date(since)
-        rcpages = set()
+        deleted_pageids = set()
+        rcpages = ws.utils.OrderedSet()
+        rctitles = ws.utils.OrderedSet()
 
-        # Items in the recentchanges table are periodically purged according to
-        # http://www.mediawiki.org/wiki/Manual:$wgRCMaxAge
-        # By default the max age is 13 weeks: if a larger timespan is requested
-        # here, it's very important to warn that the changes are not available
-#        if self.api.oldest_recent_change > since:
-        if rc.oldest_recent_change(self.db) > since:
-            raise ShortRecentChangesError()
-
-#        rc_params = {
-#            "action": "query",
-#            "list": "recentchanges",
-#            "rctype": "edit|new|log",
-#            "rcprop": "ids",
-#            "rclimit": "max",
-#            "rcdir": "newer",
-#            "rcstart": since_f,
-#        }
-#        for change in self.api.list(rc_params):
         rc_params = {
+            "list": "recentchanges",
             "type": {"edit", "new", "log"},
-            "prop": {"ids"},
+            "prop": {"ids", "loginfo", "title"},
             "dir": "newer",
-            "start": since_f,
+            "start": since,
         }
-        for change in rc.list(self.db, rc_params):
+        for change in self.db.query(rc_params):
             # add pageid for edits, new pages and target pages of log events
-            # (this implicitly handles all move, protect, delete actions)
-            rcpages.add(change["pageid"])
+            # (this implicitly handles all move, protect, delete, import actions)
+            if change["pageid"] > 0:
+                rcpages.add(change["pageid"])
 
-            # TODO: examine logs (needs rcprop=loginfo)
-            #   merge       (revision - or maybe page too?)
-            #   import      (everything?)
-            #   suppress    (everything?)
-#            if change["type"] == "log":
-#                if change["logtype"] == "merge":
-#                    ...
+            if change["type"] == "log":
+                # Moving a page creates a "move" log event, but not a "new" log event for the
+                # redirect, so we have to extract the new page ID manually.
+                if change["logtype"] == "move":
+                    rctitles.add(change["title"])
+                elif change["logaction"] in {"delete_redir", "delete"}:
+                    # note that pageid in recentchanges corresponds to log_page
+                    deleted_pageids.add(change["pageid"])
 
-        return rcpages
+        # resolve titles to IDs (we actually need to call the API, see above)
+        if rctitles:
+            for chunk in ws.utils.iter_chunks(rctitles, self.api.max_ids_per_query):
+                params = {
+                    "action": "query",
+                    "titles": "|".join(chunk),
+                }
+                pages = list(self.api.call_api(params)["pages"].values())
+
+                # ordering of SQL inserts is important for moved pages, but MediaWiki does
+                # not return ordered results for the titles= parameter
+                keys = list(rctitles.keys())
+                pages.sort(key=lambda page: keys.index(page["title"]))
+
+                for page in pages:
+                    # skip missing pages (we don't detect "move without leaving a redirect" until here)
+                    if "pageid" in page:
+                        rcpages.add(page["pageid"])
+
+        return deleted_pageids, rcpages
+
+    def get_logpages(self, since):
+        deleted_pageids = set()
+        modified = ws.utils.OrderedSet()
+
+        le_params = {
+            "list": "logevents",
+            "prop": {"type", "details", "ids"},
+            "dir": "newer",
+            "start": since,
+        }
+        for le in self.db.query(le_params):
+            if le["type"] in {"delete", "protect", "move", "import"}:
+                if le["action"] in {"delete_redir", "delete"}:
+                    deleted_pageids.add(le["logpage"])
+                else:
+                    modified.add(le["logpage"])
+
+        return deleted_pageids, modified

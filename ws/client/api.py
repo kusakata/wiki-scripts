@@ -3,7 +3,7 @@
 import hashlib
 import logging
 
-from ..utils import RateLimited, LazyProperty, parse_date
+from ..utils import RateLimited, LazyProperty
 
 from .connection import Connection, APIError
 from .site import Site
@@ -36,33 +36,16 @@ class API(Connection):
 
         .. _`MediaWiki#API:Login`: https://www.mediawiki.org/wiki/API:Login
         """
-        def do_login(self, username, password, token=None):
-            """
-            Login function that handles CSRF protection, see MediaWiki bug 23076:
-            https://bugzilla.wikimedia.org/show_bug.cgi?id=23076
-
-            :returns: ``True`` on successful login, otherwise ``False``
-            """
-            data = {
-                "action": "login",
-                "lgname": username,
-                "lgpassword": password
-            }
-            if token:
-                data["lgtoken"] = token
-            result = self.call_api(data)
-            if result["result"] == "Success":
-                return True
-            elif result["result"] == "NeedToken" and not token:
-                return do_login(self, username, password, result["token"])
-            else:
-                return False
-
         # reset the properties related to login
         del self.user
         del self.max_ids_per_query
+        del self._csrftoken
 
-        status = do_login(self, username, password)
+        # get token and log in
+        token = self.call_api(action="query", meta="tokens", type="login")["tokens"]["logintoken"]
+        result = self.call_api(action="login", lgname=username, lgpassword=password, lgtoken=token)
+        status = result["result"] == "Success"
+
         if status is True and self.user.is_loggedin:
             return True
         logger.warn("Failed login attempt for user '{}'".format(username))
@@ -135,15 +118,17 @@ class API(Connection):
             "action": "query",
             "list": "recentchanges",
             "rcprop": "ids",
-            "rctype": "edit",
+            "rctype": "edit|new",
             "rclimit": "1",
             "continue": "",  # needed only to silence stupid deprecation warning
         }
-        result = self.call_api(params)
-        return result["recentchanges"][0]["revid"]
+        recentchanges = self.call_api(params)["recentchanges"]
+        if len(recentchanges) == 0:
+            return None
+        return recentchanges[0]["revid"]
 
     @property
-    def oldest_recent_change(self):
+    def oldest_rc_timestamp(self):
         """
         A timestamp of the oldest entry stored in the ``recentchanges`` table.
 
@@ -163,9 +148,40 @@ class API(Connection):
             "rclimit": "1",
             "continue": "",  # needed only to silence stupid deprecation warning
         }
-        result = self.call_api(params)
-        timestamp = result["recentchanges"][0]["timestamp"]
-        return parse_date(timestamp)
+        recentchanges = self.call_api(params)["recentchanges"]
+        if len(recentchanges) == 0:
+            return None
+        return recentchanges[0]["timestamp"]
+
+    @property
+    def newest_rc_timestamp(self):
+        """
+        Returns a timestamp of the newest entry stored in the ``recentchanges`` table.
+        """
+        params = {
+            "action": "query",
+            "list": "recentchanges",
+            "rcprop": "timestamp",
+            "rcdir": "older",
+            "rclimit": "1",
+            "continue": "",  # needed only to silence stupid deprecation warning
+        }
+        recentchanges = self.call_api(params)["recentchanges"]
+        if len(recentchanges) == 0:
+            return None
+        return recentchanges[0]["timestamp"]
+
+    def Title(self, title):
+        """
+        Parse a MediaWiki title.
+
+        :param str title: page title to be parsed
+        :returns: a :py:class:`ws.parser_helpers.title.Title` object
+        """
+        # lazy import - ws.parser_helpers.title imports mwparserfromhell which is
+        # an optional dependency
+        from ..parser_helpers.title import Context, Title
+        return Title(Context.from_api(self), title)
 
 
     def query_continue(self, params=None, **kwargs):
@@ -300,15 +316,14 @@ class API(Connection):
             # create copy before adding token
             params = params.copy()
 
-        # ensure that the token is passed
-        params["token"] = self._csrftoken
-
         # max tries
         max_retries = 2
 
         retries = max_retries
         while retries > 0:
             try:
+                # ensure that the new token is passed when renewed
+                params["token"] = self._csrftoken
                 return self.call_api(params)
             except APIError as e:
                 retries -= 1

@@ -8,7 +8,8 @@ Known incompatibilities from MediaWiki schema:
   a MediaWiki database directly. This wouldn't be possible even theoretically,
   since the database can contain serialized PHP objects etc.
 - Added some custom tables.
-- Enforced foreign key constraints (not present in MediaWiki's MySQL schema).
+- Enforced foreign key constraints, including namespaces stored in custom
+  tables, and some check constraints.
 - Columns not available via the API (e.g. user passwords) are nullable, since
   they are not part of the mirroring process. Likewise revision.rev_text_id
   is nullable so that we can sync metadata and text separately.
@@ -24,18 +25,27 @@ Known incompatibilities from MediaWiki schema:
 - Boolean columns use Boolean type instead of SmallInteger as in MediaWiki.
 - Unknown/invalid IDs are represented by NULL instead of 0. Except for user_id,
   where we add a dummy user with id = 0 to represent anonymous users.
+- Removed default values from all timestamp columns.
+- Removed silly default values - if we don't know, let's make it NULL.
+- Revamped the tags tables:
+    - Besides the tag name, we need to store everything that MediaWiki generates
+      or stores elsewhere.
+    - The change_tag table was split into tagged_recentchange, tagged_logevent,
+      tagged_revision and tagged_archived_revision. Foreign keys on the other
+      tables are enforced.
+    - The equivalent of the tag_summary table does not exist, we can live with
+      the GROUP BY queries.
 """
 
 # TODO:
 # - most foreign keys are nullable in MW's PostgreSQL schema and have an ON DELETE clause
-# - some non-nullable columns have silly default values - if we don't know, let's make it NULL
+# - read https://www.postgresql.org/docs/current/static/indexes.html and invent better indexes
 
 from sqlalchemy import \
         Table, Column, ForeignKey, Index, PrimaryKeyConstraint, ForeignKeyConstraint, CheckConstraint
 from sqlalchemy.types import \
         Boolean, SmallInteger, Integer, BigInteger, Float, \
-        Unicode, UnicodeText, Enum, DateTime
-from sqlalchemy.dialects.mysql import MEDIUMTEXT
+        Unicode, UnicodeText, Enum, DateTime, ARRAY
 
 from .sql_types import \
         TinyBlob, Blob, MediumBlob, UnicodeBinary, \
@@ -43,8 +53,8 @@ from .sql_types import \
 
 
 def create_custom_tables(metadata):
-    # FIXME: even special namespaces (with negative IDs) are currently included, but most foreign keys should be restricted to non-negative values
-    # maybe pg's inheritance is the solution?   https://www.postgresql.org/docs/current/static/ddl-inherit.html
+    # Even special namespaces (with negative IDs) are included, because the recentchanges and logging tables reference them.
+    # But most foreign keys should be restricted to non-negative values using a CHECK constraint.
     namespace = Table("namespace", metadata,
         # can't be auto-incremented because we need to start from 0
         Column("ns_id", Integer, nullable=False, primary_key=True, autoincrement=False),
@@ -52,7 +62,7 @@ def create_custom_tables(metadata):
         Column("ns_content", Boolean, nullable=False, server_default="0"),
         Column("ns_subpages", Boolean, nullable=False, server_default="0"),
         Column("ns_nonincludable", Boolean, nullable=False, server_default="0"),
-        Column("ns_defaultcontentmodel", UnicodeBinary(32), server_default=None)
+        Column("ns_defaultcontentmodel", UnicodeBinary(32))
     )
 
     # table for all namespace names
@@ -91,34 +101,150 @@ def create_custom_tables(metadata):
     )
 
 
+def create_site_tables(metadata):
+    # MW incompatibility: dropped the iw_wikiid column
+    interwiki = Table("interwiki", metadata,
+        Column("iw_prefix", Unicode(32), primary_key=True, nullable=False),
+        Column("iw_url", UnicodeText, nullable=False),
+        Column("iw_api", UnicodeText),
+        Column("iw_local", Boolean, nullable=False),
+        Column("iw_trans", Boolean, nullable=False, server_default="0")
+    )
+
+    tag = Table("tag", metadata,
+        Column("tag_id", Integer, primary_key=True, nullable=False),
+        Column("tag_name", Unicode(255), nullable=False),
+        Column("tag_displayname", Unicode(255), nullable=False),
+        Column("tag_description", UnicodeText),
+        Column("tag_defined", Boolean, nullable=False, server_default="1"),
+        Column("tag_active", Boolean, nullable=False, server_default="1"),
+        Column("tag_source", ARRAY(UnicodeText))
+    )
+    Index("tag_name", tag.c.tag_name, unique=True)
+
+
+def create_recentchanges_tables(metadata):
+    # Instead of rc_namespace,rc_title there could be a foreign key to page.page_id,
+    # but recentchanges is probably intended to hold entries even if the page has
+    # been deleted in the meantime.
+    # We also don't set a foreign key constraint on rc_user for convenience, so that
+    # recentchanges can be populated independently of other tables, which can then
+    # use this for syncing.
+    # MW incompatibility: removed recentchanges.rc_ip column (not visible through the API)
+    recentchanges = Table("recentchanges", metadata,
+        Column("rc_id", Integer, primary_key=True, nullable=False),
+        Column("rc_timestamp", MWTimestamp, nullable=False),
+        # fake foreign key (see note above): rc_user -> user.user_id
+        Column("rc_user", Integer),
+        Column("rc_user_text", UnicodeBinary(255), nullable=False),
+        # recentchanges table may contain rows with rc_namespace < 0
+        Column("rc_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
+        Column("rc_title", UnicodeBinary(255), nullable=False),
+        Column("rc_comment", UnicodeBinary(767), nullable=False),
+        Column("rc_minor", Boolean, nullable=False, server_default="0"),
+        Column("rc_bot", Boolean, nullable=False, server_default="0"),
+        Column("rc_new", Boolean, nullable=False, server_default="0"),
+        # fake foreign key (see note above): rc_cur_id -> page.page_id
+        Column("rc_cur_id", Integer),
+        # fake foreign key (see note above): rc_this_oldid -> revision.rev_id
+        Column("rc_this_oldid", Integer),
+        # fake foreign key (see note above): rc_last_oldid -> revision.rev_id
+        Column("rc_last_oldid", Integer),
+        # TODO: MW 1.27 added a "categorize" value, see https://www.mediawiki.org/wiki/Manual:CategoryMembershipChanges
+        Column("rc_type", Enum("edit", "new", "log", "external", name="rc_type"), nullable=False),
+        # MW incompatibility: nullable since it is not available via API
+        Column("rc_source", UnicodeBinary(16)),
+        Column("rc_patrolled", Boolean, nullable=False, server_default="0"),
+        Column("rc_old_len", Integer),
+        Column("rc_new_len", Integer),
+        # TODO: analogous to rev_deleted or log_deleted, should be Bitfield
+        Column("rc_deleted", SmallInteger, nullable=False, server_default="0"),
+        # fake foreign key (see note above): rc_logid -> logging.log_id
+        Column("rc_logid", Integer),
+        Column("rc_log_type", UnicodeBinary(255)),
+        Column("rc_log_action", UnicodeBinary(255)),
+        # MW incompatibility: In MediaWiki, log_params is a Blob which is supposed to
+        # hold either LF separated list or serialized PHP array. We store a JSON
+        # serialization of what the API gives us.
+        Column("rc_params", JSONEncodedDict)
+    )
+    Index("rc_timestamp", recentchanges.c.rc_timestamp)
+    Index("rc_namespace_title", recentchanges.c.rc_namespace, recentchanges.c.rc_title)
+    Index("rc_cur_id", recentchanges.c.rc_cur_id)
+    Index("rc_new_name_timestamp", recentchanges.c.rc_new, recentchanges.c.rc_namespace, recentchanges.c.rc_timestamp)
+    Index("rc_ns_usertext", recentchanges.c.rc_namespace, recentchanges.c.rc_user_text)
+    Index("rc_user_text", recentchanges.c.rc_user_text, recentchanges.c.rc_timestamp)
+    Index("rc_name_type_patrolled_timestamp", recentchanges.c.rc_namespace, recentchanges.c.rc_type, recentchanges.c.rc_patrolled, recentchanges.c.rc_timestamp)
+
+    logging = Table("logging", metadata,
+        Column("log_id", Integer, primary_key=True, nullable=False),
+        Column("log_type", UnicodeBinary(32), nullable=False),
+        Column("log_action", UnicodeBinary(32), nullable=False),
+        Column("log_timestamp", MWTimestamp, nullable=False),
+        Column("log_user", Integer, ForeignKey("user.user_id", ondelete="SET NULL", deferrable=True, initially="DEFERRED")),
+        Column("log_user_text", UnicodeBinary(255), nullable=False),
+        # logging table may contain rows with log_namespace < 0
+        Column("log_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
+        Column("log_title", UnicodeBinary(255), nullable=False),
+        # this must NOT be a FK - pages can disappear and reappear, log entries are invariant
+        Column("log_page", Integer),
+        Column("log_comment", UnicodeBinary(767), nullable=False),
+        # MW incompatibility: In MediaWiki, log_params is a Blob which is supposed to
+        # hold either LF separated list or serialized PHP array. We store a JSON
+        # serialization of what the API gives us.
+        Column("log_params", JSONEncodedDict, nullable=False),
+        # TODO: analogous to rev_deleted, should be Bitfield
+        Column("log_deleted", SmallInteger, nullable=False, server_default="0")
+    )
+    Index("log_type_time", logging.c.log_type, logging.c.log_timestamp)
+    Index("log_user_time", logging.c.log_user, logging.c.log_timestamp)
+    Index("log_page_time", logging.c.log_namespace, logging.c.log_title, logging.c.log_timestamp)
+    Index("log_time", logging.c.log_timestamp)
+    Index("log_user_type_time", logging.c.log_user, logging.c.log_type, logging.c.log_timestamp)
+    Index("log_page_id_time", logging.c.log_page, logging.c.log_timestamp)
+    Index("log_type_action", logging.c.log_type, logging.c.log_action, logging.c.log_timestamp)
+    Index("log_user_text_type_time", logging.c.log_user_text, logging.c.log_type, logging.c.log_timestamp)
+    Index("log_user_text_time", logging.c.log_user_text, logging.c.log_timestamp)
+
+    tagged_recentchange = Table("tagged_recentchange", metadata,
+        Column("tgrc_tag_id", Integer, ForeignKey("tag.tag_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED"), nullable=False),
+        Column("tgrc_rc_id", Integer, ForeignKey("recentchanges.rc_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED")),
+        PrimaryKeyConstraint("tgrc_tag_id", "tgrc_rc_id")
+    )
+
+    tagged_logevent = Table("tagged_logevent", metadata,
+        Column("tgle_tag_id", Integer, ForeignKey("tag.tag_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED"), nullable=False),
+        Column("tgle_log_id", Integer, ForeignKey("logging.log_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED")),
+        PrimaryKeyConstraint("tgle_tag_id", "tgle_log_id")
+    )
+
+    # TODO: create materialized views tagged_recentchange_tgname, tagged_logevent_tgname
+    # (basically 'SELECT tgrc_rc_id, array_agg(tag_name) FROM tag JOIN tagged_recentchange GROUP BY tgrc_rc_id')
+
+
 def create_users_tables(metadata):
     user = Table("user", metadata,
         # In MediaWiki it's 0 for anonymous edits, initialization scripts and some mass imports.
         # We'll add a dummy user with user_id == 0 before populating the table.
         Column("user_id", Integer, primary_key=True, nullable=False),
-        Column("user_name", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("user_real_name", UnicodeBinary(255), nullable=False, server_default=""),
-        # MW incompatibility: set to nullable since passwords are not part of mirroring
-#        Column("user_password", TinyBlob, nullable=False),
-#        Column("user_newpassword", TinyBlob, nullable=False),
-        Column("user_password", TinyBlob, server_default=None),
-        Column("user_newpassword", TinyBlob, server_default=None),
+        Column("user_name", UnicodeBinary(255), nullable=False),
+        Column("user_real_name", UnicodeBinary(255)),
+        Column("user_password", TinyBlob),
+        Column("user_newpassword", TinyBlob),
         Column("user_newpass_time", MWTimestamp),
-        # nullable for the same reason as passwords
-#        Column("user_email", TinyBlob, nullable=False),
-        Column("user_email", TinyBlob, server_default=None),
-        Column("user_touched", MWTimestamp, nullable=False, server_default=""),
-        Column("user_token", UnicodeBinary(32), nullable=False, server_default=""),
+        Column("user_email", TinyBlob),
+        Column("user_touched", MWTimestamp),
+        Column("user_token", UnicodeBinary(32)),
         Column("user_email_authenticated", MWTimestamp),
         Column("user_email_token", UnicodeBinary(32)),
         Column("user_email_token_expires", MWTimestamp),
         Column("user_registration", MWTimestamp),
         Column("user_editcount", Integer),
-        Column("user_password_expires", MWTimestamp, server_default=None)
+        Column("user_password_expires", MWTimestamp)
     )
     Index("user_name", user.c.user_name, unique=True)
     Index("user_email_token", user.c.user_email_token)
-    Index("user_email", user.c.user_email, mysql_length=50)
+    Index("user_email", user.c.user_email)
 
     user_groups = Table("user_groups", metadata,
         Column("ug_user", Integer, ForeignKey("user.user_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED"), nullable=False),
@@ -135,12 +261,12 @@ def create_users_tables(metadata):
         Column("ipb_by", Integer, ForeignKey("user.user_id", deferrable=True, initially="DEFERRED"), nullable=False),
         Column("ipb_by_text", UnicodeBinary(255), nullable=False, server_default=""),
         Column("ipb_reason", UnicodeBinary(767), nullable=False),
-        Column("ipb_timestamp", MWTimestamp, nullable=False, server_default=""),
+        Column("ipb_timestamp", MWTimestamp, nullable=False),
         Column("ipb_auto", Boolean, nullable=False, server_default="0"),
         Column("ipb_anon_only", Boolean, nullable=False, server_default="0"),
         Column("ipb_create_account", Boolean, nullable=False, server_default="1"),
         Column("ipb_enable_autoblock", Boolean, nullable=False, server_default="1"),
-        Column("ipb_expiry", MWTimestamp, nullable=False, server_default=""),
+        Column("ipb_expiry", MWTimestamp, nullable=False),
         # MW incompatibility: set to nullable, although they're not nullable in MW
         # (but that's a bug, even reported somewhere)
         Column("ipb_range_start", TinyBlob),
@@ -148,18 +274,31 @@ def create_users_tables(metadata):
         Column("ipb_deleted", SmallInteger, nullable=False, server_default="0"),
         Column("ipb_block_email", Boolean, nullable=False, server_default="0"),
         Column("ipb_allow_usertalk", Boolean, nullable=False, server_default="0"),
-        Column("ipb_parent_block_id", Integer, ForeignKey("ipblocks.ipb_id", ondelete="SET NULL", deferrable=True, initially="DEFERRED"), server_default=None),
+        Column("ipb_parent_block_id", Integer, ForeignKey("ipblocks.ipb_id", ondelete="SET NULL", deferrable=True, initially="DEFERRED")),
         CheckConstraint("ipb_user > 0", name="check_user")
     )
-    Index("ipb_address", ipblocks.c.ipb_address, ipblocks.c.ipb_user, ipblocks.c.ipb_auto, ipblocks.c.ipb_anon_only, mysql_length={"ipb_address": 255}, unique=True)
+    Index("ipb_address", ipblocks.c.ipb_address, ipblocks.c.ipb_user, ipblocks.c.ipb_auto, ipblocks.c.ipb_anon_only, unique=True)
     Index("ipb_user", ipblocks.c.ipb_user)
-    Index("ipb_range", ipblocks.c.ipb_range_start, ipblocks.c.ipb_range_end, mysql_length={"ipb_range_start": 8, "ipb_range_end": 8})
+    Index("ipb_range", ipblocks.c.ipb_range_start, ipblocks.c.ipb_range_end)
     Index("ipb_timestamp", ipblocks.c.ipb_timestamp)
     Index("ipb_expiry", ipblocks.c.ipb_expiry)
     Index("ipb_parent_block_id", ipblocks.c.ipb_parent_block_id)
 
+    # TODO: prepared for a custom watchlist browser
+#    watchlist = Table("watchlist", metadata,
+#        Column("wl_user", Integer, ForeignKey("user.user_id"), nullable=False),
+#        # not a FK to page.page_id, because delete+undelete should not remove entries from the watchlist
+#        Column("wl_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
+#        Column("wl_title", UnicodeBinary(255), nullable=False),
+#        Column("wl_notificationtimestamp", MWTimestamp),
+#        CheckConstraint("wl_namespace >= 0", name="check_namespace")
+#    )
+#    Index("wl_user", watchlist.c.wl_user, watchlist.c.wl_namespace, watchlist.c.wl_title, unique=True)
+#    Index("wl_namespace_title", watchlist.c.wl_namespace, watchlist.c.wl_title)
+#    Index("wl_user_notificationtimestamp", watchlist.c.wl_user, watchlist.c.wl_notificationtimestamp)
 
-def create_pages_tables(metadata):
+
+def create_revisions_tables(metadata):
     # MW incompatibility:
     # - removed ar_text, ar_flags columns
     # - reordered columns to match the revision table
@@ -170,21 +309,25 @@ def create_pages_tables(metadata):
         Column("ar_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
         Column("ar_title", UnicodeBinary(255), nullable=False),
         # for preserving revision.rev_id
-        Column("ar_rev_id", Integer),
+        Column("ar_rev_id", Integer, nullable=False),
         # like revision.rev_page, but nullable because pages deleted prior to MW 1.11 have NULL
-        Column("ar_page_id", Integer, ForeignKey("page.page_id", deferrable=True, initially="DEFERRED")),
+        # (not a FK because archived pages don't exist in page)
+        # NOTE: not visible via MW API
+        Column("ar_page_id", Integer),
         Column("ar_text_id", Integer, ForeignKey("text.old_id", deferrable=True, initially="DEFERRED")),
         Column("ar_comment", UnicodeBinary(767), nullable=False),
         Column("ar_user", Integer, ForeignKey("user.user_id", deferrable=True, initially="DEFERRED"), nullable=False),
         Column("ar_user_text", UnicodeBinary(255), nullable=False),
         Column("ar_timestamp", MWTimestamp, nullable=False),
         Column("ar_minor_edit", Boolean, nullable=False, server_default="0"),
+        # TODO: analogous to rev_deleted, should be Bitfield
         Column("ar_deleted", SmallInteger, nullable=False, server_default="0"),
         Column("ar_len", Integer),
-        Column("ar_parent_id", Integer, server_default=None),
+        Column("ar_parent_id", Integer),
         Column("ar_sha1", SHA1, nullable=False, server_default=""),
-        Column("ar_content_model", UnicodeBinary(32), server_default=None),
-        Column("ar_content_format", UnicodeBinary(64), server_default=None)
+        Column("ar_content_model", UnicodeBinary(32)),
+        Column("ar_content_format", UnicodeBinary(64)),
+        CheckConstraint("ar_namespace >= 0", name="check_namespace")
     )
     Index("ar_name_title_timestamp", archive.c.ar_namespace, archive.c.ar_title, archive.c.ar_timestamp)
     Index("ar_usertext_timestamp", archive.c.ar_user_text, archive.c.ar_timestamp)
@@ -192,7 +335,6 @@ def create_pages_tables(metadata):
 
     revision = Table("revision", metadata,
         Column("rev_id", Integer, primary_key=True, nullable=False),
-        # TODO: check how this works for deleted pages (MW's PostgreSQL schema has the foreign key, so it's probably OK)
         Column("rev_page", Integer, ForeignKey("page.page_id", deferrable=True, initially="DEFERRED"), nullable=False),
         # MW incompatibility: set as nullable so that we can sync metadata and text separately
         Column("rev_text_id", Integer, ForeignKey("text.old_id", deferrable=True, initially="DEFERRED")),
@@ -205,11 +347,11 @@ def create_pages_tables(metadata):
         Column("rev_deleted", SmallInteger, nullable=False, server_default="0"),
         Column("rev_len", Integer),
         # FIXME: should be set as FK, but that probably breaks archiving
-#        Column("rev_parent_id", Integer, ForeignKey("revision.rev_id", ondelete="SET NULL"), server_default=None),
-        Column("rev_parent_id", Integer, server_default=None),
+#        Column("rev_parent_id", Integer, ForeignKey("revision.rev_id", ondelete="SET NULL")),
+        Column("rev_parent_id", Integer),
         Column("rev_sha1", SHA1, nullable=False, server_default=""),
-        Column("rev_content_model", UnicodeBinary(32), server_default=None),
-        Column("rev_content_format", UnicodeBinary(64), server_default=None),
+        Column("rev_content_model", UnicodeBinary(32)),
+        Column("rev_content_format", UnicodeBinary(64)),
     )
     Index("rev_page_id", revision.c.rev_page, revision.c.rev_id, unique=True)
     Index("rev_timestamp", revision.c.rev_timestamp)
@@ -224,24 +366,41 @@ def create_pages_tables(metadata):
         Column("old_flags", TinyBlob, nullable=False)
     )
 
+    tagged_revision = Table("tagged_revision", metadata,
+        Column("tgrev_tag_id", Integer, ForeignKey("tag.tag_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED"), nullable=False),
+        Column("tgrev_rev_id", Integer, ForeignKey("revision.rev_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED")),
+        PrimaryKeyConstraint("tgrev_tag_id", "tgrev_rev_id")
+    )
+
+    tagged_archived_revision = Table("tagged_archived_revision", metadata,
+        Column("tgar_tag_id", Integer, ForeignKey("tag.tag_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED"), nullable=False),
+        Column("tgar_rev_id", Integer, ForeignKey("archive.ar_rev_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED")),
+        PrimaryKeyConstraint("tgar_tag_id", "tgar_rev_id")
+    )
+
+    # TODO: create materialized views tagged_revision_tgname, tagged_archived_revision_tgname
+    # (basically 'SELECT tgrev_rev_id, array_agg(tag_name) FROM tag JOIN tagged_revision GROUP BY tgrev_rev_id')
+
+
+def create_pages_tables(metadata):
     # MW incompatibility: removed page.page_restrictions column (unused since MW 1.9)
+    # MW incompatibility: removed page.page_random column (useless for clients)
     page = Table("page", metadata,
         Column("page_id", Integer, primary_key=True, nullable=False),
         Column("page_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
         Column("page_title", UnicodeBinary(255), nullable=False),
         Column("page_is_redirect", Boolean, nullable=False, server_default="0"),
         Column("page_is_new", Boolean, nullable=False, server_default="0"),
-        Column("page_random", Float, nullable=False),
         Column("page_touched", MWTimestamp, nullable=False),
-        Column("page_links_updated", MWTimestamp, server_default=None),
+        Column("page_links_updated", MWTimestamp),
         # FIXME: MW defect: key to revision.rev_id, breaks relationship
         Column("page_latest", Integer, nullable=False),
         Column("page_len", Integer, nullable=False),
-        Column("page_content_model", UnicodeBinary(32), server_default=None),
-        Column("page_lang", UnicodeBinary(35), server_default=None)
+        Column("page_content_model", UnicodeBinary(32)),
+        Column("page_lang", UnicodeBinary(35)),
+        CheckConstraint("page_namespace >= 0", name="check_namespace")
     )
     Index("page_namespace_title", page.c.page_namespace, page.c.page_title, unique=True)
-    Index("page_random", page.c.page_random)
     Index("page_len", page.c.page_len)
     Index("page_redirect_namespace_len", page.c.page_is_redirect, page.c.page_namespace, page.c.page_len)
 
@@ -249,7 +408,7 @@ def create_pages_tables(metadata):
         Column("pp_page", Integer, ForeignKey("page.page_id", ondelete="CASCADE", deferrable=True, initially="DEFERRED"), nullable=False),
         Column("pp_propname", UnicodeBinary(60), nullable=False),
         Column("pp_value", Blob, nullable=False),
-        Column("pp_sortkey", Float, server_default=None)
+        Column("pp_sortkey", Float)
     )
     Index("pp_page_propname", page_props.c.pp_page, page_props.c.pp_propname, unique=True)
     Index("pp_propname_page", page_props.c.pp_propname, page_props.c.pp_page, unique=True)
@@ -261,6 +420,7 @@ def create_pages_tables(metadata):
         Column("pr_type", UnicodeBinary(60), nullable=False),
         Column("pr_level", UnicodeBinary(60), nullable=False),
         Column("pr_cascade", Boolean, nullable=False),
+        # unused even in MW, reserved for the future
         Column("pr_user", Integer),
         Column("pr_expiry", MWTimestamp)
     )
@@ -277,7 +437,8 @@ def create_pages_tables(metadata):
         Column("pt_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
         Column("pt_title", UnicodeBinary(255), nullable=False),
         Column("pt_level", UnicodeBinary(60), nullable=False),
-        Column("pt_expiry", MWTimestamp, nullable=False, server_default="")
+        Column("pt_expiry", MWTimestamp, nullable=False),
+        CheckConstraint("pt_namespace >= 0", name="check_namespace")
     )
     Index("pt_namespace_title", protected_titles.c.pt_namespace, protected_titles.c.pt_title, unique=True)
 
@@ -296,9 +457,10 @@ def create_recomputable_tables(metadata):
     redirect = Table("redirect", metadata,
         Column("rd_from", Integer, ForeignKey("page.page_id"), primary_key=True, nullable=False, server_default="0"),
         Column("rd_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
-        Column("rd_title", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("rd_interwiki", Unicode(32), server_default=None),
-        Column("rd_fragment", UnicodeBinary(255), server_default=None)
+        Column("rd_title", UnicodeBinary(255), nullable=False),
+        Column("rd_interwiki", Unicode(32)),
+        Column("rd_fragment", UnicodeBinary(255)),
+        CheckConstraint("rd_namespace >= 0", name="check_namespace")
     )
     Index("rd_namespace_title_from", redirect.c.rd_namespace, redirect.c.rd_title, redirect.c.rd_from)
 
@@ -307,13 +469,15 @@ def create_recomputable_tables(metadata):
         # TODO: useless, should be in view
         Column("pl_from_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
         Column("pl_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
-        Column("pl_title", UnicodeBinary(255), nullable=False, server_default="")
+        Column("pl_title", UnicodeBinary(255), nullable=False),
+        CheckConstraint("pl_from_namespace >= 0", name="check_from_namespace"),
+        CheckConstraint("pl_namespace >= 0", name="check_namespace")
     )
 
     iwlinks = Table("iwlinks", metadata,
         Column("iwl_from", Integer, ForeignKey("page.page_id"), nullable=False, server_default="0"),
         Column("iwl_prefix", UnicodeBinary(20), nullable=False, server_default=""),
-        Column("iwl_title", UnicodeBinary(255), nullable=False, server_default=""),
+        Column("iwl_title", UnicodeBinary(255), nullable=False),
     )
 
     externallinks = Table("externallinks", metadata,
@@ -325,14 +489,15 @@ def create_recomputable_tables(metadata):
 
     langlinks = Table("langlinks", metadata,
         Column("ll_from", Integer, ForeignKey("page.page_id"), nullable=False, server_default="0"),
-        Column("ll_lang", UnicodeBinary(20), nullable=False, server_default=""),
-        Column("ll_title", UnicodeBinary(255), nullable=False, server_default="")
+        Column("ll_lang", UnicodeBinary(20), nullable=False),
+        Column("ll_title", UnicodeBinary(255), nullable=False)
     )
 
     imagelinks = Table("imagelinks", metadata,
         Column("il_from", Integer, ForeignKey("page.page_id"), nullable=False, server_default="0"),
         Column("il_from_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
-        Column("il_to", UnicodeBinary(255), nullable=False, server_default="")
+        Column("il_to", UnicodeBinary(255), nullable=False),
+        CheckConstraint("il_namespace >= 0", name="check_namespace")
     )
 
     templatelinks = Table("templatelinks", metadata,
@@ -340,146 +505,120 @@ def create_recomputable_tables(metadata):
         # TODO: useless, should be in view
         Column("tl_from_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
         Column("tl_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
-        Column("tl_title", UnicodeBinary(255), nullable=False, server_default="")
+        Column("tl_title", UnicodeBinary(255), nullable=False),
+        CheckConstraint("tl_from_namespace >= 0", name="check_from_namespace"),
+        CheckConstraint("tl_namespace >= 0", name="check_namespace")
     )
 
     categorylinks = Table("categorylinks", metadata,
-        Column("cl_from", Integer, ForeignKey("page.page_id"), nullable=False, server_default="0"),
-        Column("cl_to", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("cl_sortkey", UnicodeBinary(230), nullable=False, server_default=""),
-        Column("cl_sortkey", UnicodeBinary(255), nullable=False, server_default=""),
+        Column("cl_from", Integer, ForeignKey("page.page_id"), nullable=False),
+        Column("cl_to", UnicodeBinary(255), nullable=False),
+        Column("cl_sortkey", UnicodeBinary(230), nullable=False),
+        Column("cl_sortkey_prefix", UnicodeBinary(255), nullable=False),
         Column("cl_timestamp", DateTime, nullable=False),
         Column("cl_collation", UnicodeBinary(32), nullable=False, server_default=""),
         Column("cl_type", Enum("page", "subcat", "file", name="cl_type"), nullable=False, server_default="page")
     )
 
 
-def create_recentchanges_tables(metadata):
-    # Instead of rc_namespace,rc_title there could be a foreign key to page.page_id,
-    # but recentchanges is probably intended to hold entries even if the page has
-    # been deleted in the meantime.
-    # We also don't set a foreign key constraint on rc_user for convenience, so that
-    # recentchanges can be populated independently of other tables, which can then
-    # use this for syncing.
-    recentchanges = Table("recentchanges", metadata,
-        Column("rc_id", Integer, primary_key=True, nullable=False),
-        Column("rc_timestamp", MWTimestamp, nullable=False, server_default=""),
-        # fake foreign key (see note above): rc_user -> user.user_id
-        Column("rc_user", Integer),
-        Column("rc_user_text", UnicodeBinary(255), nullable=False),
-        # FIXME: can contain negative values
-#        Column("rc_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
-        Column("rc_namespace", Integer, nullable=False),
-        Column("rc_title", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("rc_comment", UnicodeBinary(767), nullable=False, server_default=""),
-        Column("rc_minor", Boolean, nullable=False, server_default="0"),
-        Column("rc_bot", Boolean, nullable=False, server_default="0"),
-        Column("rc_new", Boolean, nullable=False, server_default="0"),
-        # fake foreign key (see note above): rc_cur_id -> page.page_id
-        Column("rc_cur_id", Integer),
-        # fake foreign key (see note above): rc_this_oldid -> revision.rev_id
-        Column("rc_this_oldid", Integer),
-        # fake foreign key (see note above): rc_last_oldid -> revision.rev_id
-        Column("rc_last_oldid", Integer),
-        # TODO: MW 1.27 added a "categorize" value, see https://www.mediawiki.org/wiki/Manual:CategoryMembershipChanges
-        Column("rc_type", Enum("edit", "new", "log", "external", name="rc_type"), nullable=False),
-        # MW incompatibility: nullable since it is not available via API
-        Column("rc_source", UnicodeBinary(16)),
-        Column("rc_patrolled", Boolean, nullable=False, server_default="0"),
-        # MW incompatibility: nullable since it is not available via API
-        Column("rc_ip", UnicodeBinary(40)),
-        Column("rc_old_len", Integer),
-        Column("rc_new_len", Integer),
-        # TODO: analogous to rev_deleted or log_deleted, should be Bitfield
-        Column("rc_deleted", SmallInteger, nullable=False, server_default="0"),
-        # fake foreign key (see note above): rc_logid -> logging.log_id
-        Column("rc_logid", Integer),
-        Column("rc_log_type", UnicodeBinary(255)),
-        Column("rc_log_action", UnicodeBinary(255)),
-        # MW incompatibility: In MediaWiki, log_params is a Blob which is supposed to
-        # hold either LF separated list or serialized PHP array. We store a JSON
-        # serialization of what the API gives us.
-        Column("rc_params", JSONEncodedDict)
+def create_multimedia_tables(metadata):
+    image = Table("image", metadata,
+        Column("img_name", UnicodeBinary(255), nullable=False, primary_key=True),
+        Column("img_size", Integer, nullable=False),
+        Column("img_width", Integer, nullable=False),
+        Column("img_height", Integer, nullable=False),
+        Column("img_metadata", MediumBlob, nullable=False, server_default=""),
+        Column("img_bits", Integer, nullable=False),
+        Column("img_media_type", Enum("UNKNOWN", "BITMAP", "DRAWING", "AUDIO", "VIDEO", "MULTIMEDIA", "OFFICE", "BLOB", "EXECUTABLE", "ARCHIVE")),
+        Column("img_major_mime", Enum("unknown", "application", "audio", "image", "text", "video", "message", "model", "multipart", "chemical"), nullable=False, server_default="unknown"),
+        Column("img_minor_mime", UnicodeBinary(100), nullable=False, server_default="unknown"),
+        Column("img_description", UnicodeBinary(767), nullable=False),
+        Column("img_user", Integer, ForeignKey("user.user_id"), nullable=False),
+        Column("img_user_text", UnicodeBinary(255), nullable=False),
+        Column("img_timestamp", MWTimestamp, nullable=False),
+        Column("img_sha1", SHA1, nullable=False, server_default="")
     )
-    Index("rc_timestamp", recentchanges.c.rc_timestamp)
-    Index("rc_namespace_title", recentchanges.c.rc_namespace, recentchanges.c.rc_title)
-    Index("rc_cur_id", recentchanges.c.rc_cur_id)
-    Index("rc_new_name_timestamp", recentchanges.c.rc_new, recentchanges.c.rc_namespace, recentchanges.c.rc_timestamp)
-    Index("rc_ip", recentchanges.c.rc_ip)
-    Index("rc_ns_usertext", recentchanges.c.rc_namespace, recentchanges.c.rc_user_text)
-    Index("rc_user_text", recentchanges.c.rc_user_text, recentchanges.c.rc_timestamp)
+    Index("img_usertext_timestamp", image.c.img_user_text, image.c.img_timestamp)
+    Index("img_size", image.c.img_size)
+    Index("img_timestamp", image.c.img_timestamp)
+    Index("img_sha1", image.c.img_sha1)
+    Index("img_media_mime", image.c.img_media_type, image.c.img_major_mime, image.c.img_minor_mime)
 
-    logging = Table("logging", metadata,
-        Column("log_id", Integer, primary_key=True, nullable=False),
-        Column("log_type", UnicodeBinary(32), nullable=False, server_default=""),
-        Column("log_action", UnicodeBinary(32), nullable=False, server_default=""),
-        Column("log_timestamp", MWTimestamp, nullable=False, server_default="19700101000000"),
-        Column("log_user", Integer, ForeignKey("user.user_id", ondelete="SET NULL", deferrable=True, initially="DEFERRED")),
-        Column("log_user_text", UnicodeBinary(255), nullable=False, server_default=""),
-        # FIXME: logging table may contain rows with log_namespace < 0
-#        Column("log_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
-        Column("log_namespace", Integer, nullable=False),
-        Column("log_title", UnicodeBinary(255), nullable=False, server_default=""),
-        # this must NOT be a FK - pages can disappear and reappear, log entries are invariant
-        Column("log_page", Integer),
-        Column("log_comment", UnicodeBinary(767), nullable=False, server_default=""),
-        # MW incompatibility: In MediaWiki, log_params is a Blob which is supposed to
-        # hold either LF separated list or serialized PHP array. We store a JSON
-        # serialization of what the API gives us.
-        Column("log_params", JSONEncodedDict, nullable=False),
-        # TODO: analogous to rev_deleted, should be Bitfield
-        Column("log_deleted", SmallInteger, nullable=False, server_default="0")
+    oldimage = Table("oldimage", metadata,
+        Column("oi_name", UnicodeBinary(255), nullable=False),
+        Column("oi_archive_name", UnicodeBinary(255), nullable=False),
+        Column("oi_size", Integer, nullable=False),
+        Column("oi_width", Integer, nullable=False),
+        Column("oi_height", Integer, nullable=False),
+        Column("oi_bits", Integer, nullable=False),
+        Column("oi_description", UnicodeBinary(767), nullable=False),
+        Column("oi_user", Integer, ForeignKey("user.user_id"), nullable=False),
+        Column("oi_user_text", UnicodeBinary(255), nullable=False),
+        Column("oi_timestamp", MWTimestamp, nullable=False),
+        Column("oi_metadata", MediumBlob, nullable=False, server_default=""),
+        Column("oi_media_type", Enum("UNKNOWN", "BITMAP", "DRAWING", "AUDIO", "VIDEO", "MULTIMEDIA", "OFFICE", "BLOB", "EXECUTABLE", "ARCHIVE")),
+        Column("oi_major_mime", Enum("unknown", "application", "audio", "image", "text", "video", "message", "model", "multipart", "chemical"), nullable=False, server_default="unknown"),
+        Column("oi_minor_mime", UnicodeBinary(100), nullable=False, server_default="unknown"),
+        Column("oi_deleted", SmallInteger, nullable=False, server_default="0"),
+        Column("oi_sha1", SHA1, nullable=False, server_default="")
     )
-    Index("log_type_time", logging.c.log_type, logging.c.log_timestamp)
-    Index("log_user_time", logging.c.log_user, logging.c.log_timestamp)
-    Index("log_page_time", logging.c.log_namespace, logging.c.log_title, logging.c.log_timestamp)
-    Index("log_time", logging.c.log_timestamp)
-    Index("log_user_type_time", logging.c.log_user, logging.c.log_type, logging.c.log_timestamp)
-    Index("log_page_id_time", logging.c.log_page, logging.c.log_timestamp)
-    Index("log_type_action", logging.c.log_type, logging.c.log_action, logging.c.log_timestamp)
-    Index("log_user_text_type_time", logging.c.log_user_text, logging.c.log_type, logging.c.log_timestamp)
-    Index("log_user_text_time", logging.c.log_user_text, logging.c.log_timestamp)
+    Index("oi_usertext_timestamp", oldimage.c.oi_user_text, oldimage.c.oi_timestamp)
+    Index("oi_name_timestamp", oldimage.c.oi_name, oldimage.c.oi_timestamp)
+    Index("oi_name_archive_name", oldimage.c.oi_name, oldimage.c.oi_archive_name)
+    Index("oi_sha1", oldimage.c.oi_sha1)
 
-
-def create_siteinfo_tables(metadata):
-    change_tag = Table("change_tag", metadata,
-        Column("ct_rc_id", Integer, ForeignKey("recentchanges.rc_id", ondelete="SET NULL")),
-        Column("ct_log_id", Integer, ForeignKey("logging.log_id", ondelete="CASCADE")),
-        # FIXME: archiving
-        Column("ct_rev_id", Integer, ForeignKey("revision.rev_id", ondelete="CASCADE")),
-        Column("ct_tag", Unicode(255), nullable=False),
-        Column("ct_params", Blob)
+    filearchive = Table("filearchive", metadata,
+        Column("fa_id", Integer, primary_key=True, nullable=False),
+        Column("fa_name", UnicodeBinary(255), nullable=False),
+        Column("fa_archive_name", UnicodeBinary(255)),
+        Column("fa_storage_group", UnicodeBinary(16)),
+        Column("fa_storage_key", UnicodeBinary(64)),
+        Column("fa_deleted_user", Integer, ForeignKey("user.user_id")),
+        Column("fa_deleted_timestamp", MWTimestamp),
+        Column("fa_deleted_reason", UnicodeBinary(767)),
+        Column("fa_size", Integer),
+        Column("fa_width", Integer),
+        Column("fa_height", Integer),
+        Column("fa_metadata", MediumBlob, server_default=""),
+        Column("fa_bits", Integer),
+        Column("fa_media_type", Enum("UNKNOWN", "BITMAP", "DRAWING", "AUDIO", "VIDEO", "MULTIMEDIA", "OFFICE", "BLOB", "EXECUTABLE", "ARCHIVE")),
+        Column("fa_major_mime", Enum("unknown", "application", "audio", "image", "text", "video", "message", "model", "multipart", "chemical"), server_default="unknown"),
+        Column("fa_minor_mime", UnicodeBinary(100), server_default="unknown"),
+        Column("fa_description", UnicodeBinary(767)),
+        Column("fa_user", Integer, ForeignKey("user.user_id")),
+        Column("fa_user_text", UnicodeBinary(255)),
+        Column("fa_timestamp", MWTimestamp),
+        Column("fa_deleted", SmallInteger, nullable=False, server_default="0"),
+        Column("fa_sha1", SHA1, nullable=False, server_default="")
     )
-    Index("change_tag_rc_tag", change_tag.c.ct_rc_id, change_tag.c.ct_tag, unique=True)
-    Index("change_tag_log_tag", change_tag.c.ct_log_id, change_tag.c.ct_tag, unique=True)
-    Index("change_tag_rev_tag", change_tag.c.ct_rev_id, change_tag.c.ct_tag, unique=True)
-    Index("change_tag_tag_id", change_tag.c.ct_tag, change_tag.c.ct_rc_id, change_tag.c.change_tag.c.ct_rev_id, change_tag.c.ct_log_id)
+    Index("fa_name", filearchive.c.fa_name, filearchive.c.fa_timestamp)
+    Index("fa_storage_group", filearchive.c.fa_storage_group, filearchive.c.fa_storage_key)
+    Index("fa_deleted_timestamp", filearchive.c.fa_deleted_timestamp)
+    Index("fa_user_timestamp", filearchive.c.fa_user_text, filearchive.c.fa_timestamp)
+    Index("fa_sha1", filearchive.c.fa_sha1)
 
-    valid_tag = Table("valid_tag", metadata,
-        Column("vt_tag", Unicode(255), primary_key=True, nullable=False)
-    )
+    # TODO: uploadstash table
 
-    tag_summary = Table("tag_summary", metadata,
-        Column("ts_rc_id", Integer, ForeignKey("recentchanges.rc_id", ondelete="SET NULL")),
-        Column("ts_log_id", Integer, ForeignKey("logging.log_id", ondelete="CASCADE")),
-        # FIXME: archiving
-        Column("ts_rev_id", Integer, ForeignKey("revision.rev_id", ondelete="CASCADE")),
-        Column("ts_tags", MediumBlob, nullable=False)
-    )
-    Index("tag_summary_rc_id", tag_summary.c.ts_rc_id, unique=True)
-    Index("tag_summary_log_id", tag_summary.c.ts_log_id, unique=True)
-    Index("tag_summary_rev_id", tag_summary.c.ts_rev_id, unique=True)
 
+def create_unused_tables(metadata):
+    # we don't sync the site stats - the values are inconsistent even in MW
     site_stats = Table("site_stats", metadata,
         Column("ss_row_id", Integer, nullable=False),
+        # on the ArchWiki, ss_total_edits is greater than the max revision ID
         Column("ss_total_edits", BigInteger, server_default="0"),
+        # an approximation anyway
         Column("ss_good_articles", BigInteger, server_default="0"),
         Column("ss_total_pages", BigInteger, server_default="-1"),
+        # see https://lists.archlinux.org/pipermail/arch-general/2014-February/034923.html
         Column("ss_users", BigInteger, server_default="-1"),
+        # see https://wiki.archlinux.org/index.php/ArchWiki_talk:Statistics#Number_of_active_users
         Column("ss_active_users", BigInteger, server_default="-1"),
+        # deprecated since MW 1.5
+        Column("ss_admins", BigInteger, server_default="-1"),
         Column("ss_images", Integer, server_default="0")
     )
 
+    # as of MW 1.28, the 'sites' and 'site_identifiers' tables are not visible through the API
     sites = Table("sites", metadata,
         Column("site_id", Integer, nullable=False, primary_key=True),
         Column("site_global_key", UnicodeBinary(32), nullable=False),
@@ -504,135 +643,33 @@ def create_siteinfo_tables(metadata):
 
     # TODO: site_identifiers table
 
-    interwiki = Table("interwiki", metadata,
-        Column("iw_prefix", Unicode(32), nullable=False),
-        Column("iw_url", Blob, nullable=False),
-        Column("iw_api", Blob, nullable=False),
-        Column("iw_wikiid", Unicode(64), nullable=False),
-        Column("iw_local", Boolean, nullable=False),
-        Column("iw_trans", SmallInteger, nullable=False, server_default="0")
-    )
-    Index("iw_prefix", interwiki.c.iw_prefix, unique=True)
-
-    watchlist = Table("watchlist", metadata,
-        Column("wl_user", Integer, ForeignKey("user.user_id"), nullable=False),
-        # FIXME: MW defect: why is there not a FK to page.page_id?
-        Column("wl_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
-        Column("wl_title", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("wl_notificationtimestamp", MWTimestamp)
-    )
-    Index("wl_user", watchlist.c.wl_user, watchlist.c.wl_namespace, watchlist.c.wl_title, unique=True)
-    Index("wl_namespace_title", watchlist.c.wl_namespace, watchlist.c.wl_title)
-    Index("wl_user_notificationtimestamp", watchlist.c.wl_user, watchlist.c.wl_notificationtimestamp)
-
-
-def create_multimedia_tables(metadata):
-    image = Table("image", metadata,
-        Column("img_name", UnicodeBinary(255), nullable=False, primary_key=True, server_default=""),
-        Column("img_size", Integer, nullable=False, server_default="0"),
-        Column("img_width", Integer, nullable=False, server_default="0"),
-        Column("img_height", Integer, nullable=False, server_default="0"),
-        Column("img_metadata", MediumBlob, nullable=False),
-        Column("img_bits", Integer, nullable=False,
-               server_default="0"),
-        Column("img_media_type", Enum("UNKNOWN", "BITMAP", "DRAWING", "AUDIO", "VIDEO", "MULTIMEDIA", "OFFICE", "BLOB", "EXECUTABLE", "ARCHIVE"), server_default=None),
-        Column("img_major_mime", Enum("unknown", "application", "audio", "image", "text", "video", "message", "model", "multipart", "chemical"), nullable=False, server_default="unknown"),
-        Column("img_minor_mime", UnicodeBinary(100), nullable=False, server_default="unknown"),
-        Column("img_description", UnicodeBinary(767), nullable=False),
-        Column("img_user", Integer, ForeignKey("user.user_id"), nullable=False, server_default="0"),
-        Column("img_user_text", UnicodeBinary(255), nullable=False),
-        Column("img_timestamp", MWTimestamp, nullable=False, server_default=""),
-        Column("img_sha1", SHA1, nullable=False, server_default="")
-    )
-    Index("img_usertext_timestamp", image.c.img_user_text, image.c.img_timestamp)
-    Index("img_size", image.c.img_size)
-    Index("img_timestamp", image.c.img_timestamp)
-    Index("img_sha1", image.c.img_sha1)
-    Index("img_media_mime", image.c.img_media_type, image.c.img_major_mime, image.c.img_minor_mime)
-
-    oldimage = Table("oldimage", metadata,
-        Column("oi_name", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("oi_archive_name", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("oi_size", Integer, nullable=False, server_default="0"),
-        Column("oi_width", Integer, nullable=False, server_default="0"),
-        Column("oi_height", Integer, nullable=False, server_default="0"),
-        Column("oi_bits", Integer, nullable=False, server_default="0"),
-        Column("oi_description", UnicodeBinary(767), nullable=False),
-        Column("oi_user", Integer, ForeignKey("user.user_id"), nullable=False, server_default="0"),
-        Column("oi_user_text", UnicodeBinary(255), nullable=False),
-        Column("oi_timestamp", MWTimestamp, nullable=False, server_default=""),
-        Column("oi_metadata", MediumBlob, nullable=False),
-        Column("oi_media_type", Enum("UNKNOWN", "BITMAP", "DRAWING", "AUDIO", "VIDEO", "MULTIMEDIA", "OFFICE", "BLOB", "EXECUTABLE", "ARCHIVE"), server_default=None),
-        Column("oi_major_mime", Enum("unknown", "application", "audio", "image", "text", "video", "message", "model", "multipart", "chemical"), nullable=False, server_default="unknown"),
-        Column("oi_minor_mime", UnicodeBinary(100), nullable=False, server_default="unknown"),
-        Column("oi_deleted", SmallInteger, nullable=False, server_default="0"),
-        Column("oi_sha1", SHA1, nullable=False, server_default="")
-    )
-    Index("oi_usertext_timestamp", oldimage.c.oi_user_text, oldimage.c.oi_timestamp)
-    Index("oi_name_timestamp", oldimage.c.oi_name, oldimage.c.oi_timestamp)
-    Index("oi_name_archive_name", oldimage.c.oi_name, oldimage.c.oi_archive_name, mysql_length={"oi_archive_name": 14})
-    Index("oi_sha1", oldimage.c.oi_sha1)
-
-    filearchive = Table("filearchive", metadata,
-        Column("fa_id", Integer, primary_key=True, nullable=False),
-        Column("fa_name", UnicodeBinary(255), nullable=False, server_default=""),
-        Column("fa_archive_name", UnicodeBinary(255), server_default=""),
-        Column("fa_storage_group", UnicodeBinary(16)),
-        Column("fa_storage_key", UnicodeBinary(64), server_default=""),
-        Column("fa_deleted_user", Integer, ForeignKey("user.user_id")),
-        Column("fa_deleted_timestamp", MWTimestamp, server_default=""),
-        Column("fa_deleted_reason", UnicodeBinary(767), server_default=""),
-        Column("fa_size", Integer, server_default="0"),
-        Column("fa_width", Integer, server_default="0"),
-        Column("fa_height", Integer, server_default="0"),
-        Column("fa_metadata", MediumBlob),
-        Column("fa_bits", Integer, server_default="0"),
-        Column("fa_media_type", Enum("UNKNOWN", "BITMAP", "DRAWING", "AUDIO", "VIDEO", "MULTIMEDIA", "OFFICE", "BLOB", "EXECUTABLE", "ARCHIVE"), server_default=None),
-        Column("fa_major_mime", Enum("unknown", "application", "audio", "image", "text", "video", "message", "model", "multipart", "chemical"), server_default="unknown"),
-        Column("fa_minor_mime", UnicodeBinary(100), server_default="unknown"),
-        Column("fa_description", UnicodeBinary(767)),
-        Column("fa_user", Integer, ForeignKey("user.user_id"), server_default="0"),
-        Column("fa_user_text", UnicodeBinary(255)),
-        Column("fa_timestamp", MWTimestamp, server_default=""),
-        Column("fa_deleted", SmallInteger, nullable=False,
-               server_default="0"),
-        Column("fa_sha1", SHA1, nullable=False, server_default="")
-    )
-    Index("fa_name", filearchive.c.fa_name, filearchive.c.fa_timestamp)
-    Index("fa_storage_group", filearchive.c.fa_storage_group, filearchive.c.fa_storage_key)
-    Index("fa_deleted_timestamp", filearchive.c.fa_deleted_timestamp)
-    Index("fa_user_timestamp", filearchive.c.fa_user_text, filearchive.c.fa_timestamp)
-    Index("fa_sha1", filearchive.c.fa_sha1)
-
-    # TODO: uploadstash table
-
-
-def create_unused_tables(metadata):
     job = Table("job", metadata,
         Column("job_id", Integer, primary_key=True, nullable=False),
-        Column("job_cmd", UnicodeBinary(60), nullable=False, server_default=""),
+        Column("job_cmd", UnicodeBinary(60), nullable=False),
         Column("job_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
         Column("job_title", UnicodeBinary(255), nullable=False),
-        Column("job_timestamp", MWTimestamp, server_default=None),
+        Column("job_timestamp", MWTimestamp),
         Column("job_params", Blob, nullable=False),
         Column("job_random", Integer, nullable=False, server_default="0"),
         Column("job_attempts", Integer, nullable=False, server_default="0"),
         Column("job_token", UnicodeBinary(32), nullable=False, server_default=""),
-        Column("job_token_timestamp", MWTimestamp, server_default=None),
-        Column("job_sha1", SHA1, nullable=False, server_default="")
+        Column("job_token_timestamp", MWTimestamp),
+        Column("job_sha1", SHA1, nullable=False, server_default=""),
+        CheckConstraint("job_namespace >= 0", name="check_namespace")
     )
 
     objectcache = Table("objectcache", metadata,
-        Column("keyname", UnicodeBinary(255), primary_key=True, nullable=False, server_default=""),
+        Column("keyname", UnicodeBinary(255), primary_key=True, nullable=False),
         Column("value", MediumBlob),
         Column("exptime", DateTime)
     )
 
     querycache = Table("querycache", metadata,
         Column("qc_type", UnicodeBinary(32), nullable=False),
-        Column("qc_value", Integer, nullable=False, server_default="0"),
-        Column("qc_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
-        Column("qc_title", UnicodeBinary(255), nullable=False, server_default="")
+        Column("qc_value", Integer, nullable=False),
+        Column("qc_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False),
+        Column("qc_title", UnicodeBinary(255), nullable=False),
+        CheckConstraint("qc_namespace >= 0", name="check_namespace")
     )
 
     querycachetwo = Table("querycachetwo", metadata,
@@ -641,24 +678,19 @@ def create_unused_tables(metadata):
         Column("qcc_namespace", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
         Column("qcc_title", UnicodeBinary(255), nullable=False, server_default=""),
         Column("qcc_namespacetwo", Integer, ForeignKey("namespace.ns_id"), nullable=False, server_default="0"),
-        Column("qcc_titletwo", UnicodeBinary(255), nullable=False, server_default="")
+        Column("qcc_titletwo", UnicodeBinary(255), nullable=False, server_default=""),
+        CheckConstraint("qcc_namespace >= 0", name="check_namespace"),
+        CheckConstraint("qcc_namespacetwo >= 0", name="check_namespacetwo")
     )
 
     querycache_info = Table("querycache_info", metadata,
-        Column("qci_type", UnicodeBinary(32), nullable=False, server_default=""),
-        Column("qci_timestamp", MWTimestamp, nullable=False, server_default="19700101000000")
-    )
-
-    searchindex = Table("searchindex", metadata,
-        Column("si_page", Integer, nullable=False),
-        Column("si_title", Unicode(255), nullable=False, server_default=""),
-        # not binary in MediaWiki !!!
-        Column("si_text", MEDIUMTEXT(charset="utf8"), nullable=False),
-        mysql_engine="MyISAM"
+        Column("qci_type", UnicodeBinary(32), nullable=False),
+        Column("qci_timestamp", MWTimestamp, nullable=False)
     )
 
     transcache = Table("transcache", metadata,
         Column("tc_url", UnicodeBinary(255), nullable=False),
+        # not binary in MediaWiki !!!
         Column("tc_contents", UnicodeText),
         Column("tc_time", MWTimestamp, nullable=False)
     )
@@ -678,7 +710,7 @@ def create_unused_tables(metadata):
     user_newtalk = Table("user_newtalk", metadata,
         Column("user_id", Integer, ForeignKey("user.user_id")),
         Column("user_ip", UnicodeBinary(40)),
-        Column("user_last_timestamp", MWTimestamp, server_default=None)
+        Column("user_last_timestamp", MWTimestamp)
     )
     Index("un_user_id", user_newtalk.c.user_id)
     Index("un_user_ip", user_newtalk.c.user_ip)
@@ -686,7 +718,8 @@ def create_unused_tables(metadata):
 
 def create_tables(metadata):
     create_custom_tables(metadata)
-    create_users_tables(metadata)
-    create_pages_tables(metadata)
+    create_site_tables(metadata)
     create_recentchanges_tables(metadata)
-    metadata.create_all()
+    create_users_tables(metadata)
+    create_revisions_tables(metadata)
+    create_pages_tables(metadata)

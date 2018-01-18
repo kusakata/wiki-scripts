@@ -1,40 +1,66 @@
 #!/usr/bin/env python3
 
-import logging
+import sqlalchemy as sa
 
-from sqlalchemy import bindparam
-
-from ws.utils import format_date, value_or_none
-from ws.parser_helpers.title import Title
+from ws.utils import value_or_none
 import ws.db.mw_constants as mwconst
 
-from . import Grabber
+from .GrabberBase import *
 
-logger = logging.getLogger(__name__)
-
-class GrabberLogging(Grabber):
+class GrabberLogging(GrabberBase):
 
     def __init__(self, api, db):
         super().__init__(api, db)
 
+        ins_logging = sa.dialects.postgresql.insert(db.logging)
+        ins_tgle = sa.dialects.postgresql.insert(db.tagged_logevent)
+        ins_tgrc = sa.dialects.postgresql.insert(db.tagged_recentchange)
+
         self.sql = {
             ("insert", "logging"):
-                db.logging.insert(
-                    on_conflict_constraint=[db.logging.c.log_id],
-                    on_conflict_update=[
+                ins_logging.on_conflict_do_update(
+                    index_elements=[db.logging.c.log_id],
+                    set_={
                         # this should be the only column that may change in the table
-                        db.logging.c.log_deleted,
-                    ]),
+                        "log_deleted": ins_logging.excluded.log_deleted,
+                    }),
+            ("insert", "tagged_logevent"):
+                ins_tgle.values(
+                    tgle_log_id=sa.bindparam("b_log_id"),
+                    tgle_tag_id=sa.select([db.tag.c.tag_id]) \
+                                    .where(db.tag.c.tag_name == sa.bindparam("b_tag_name"))) \
+                    .on_conflict_do_nothing(),
+            ("insert", "tagged_recentchange"):
+                ins_tgrc.values(
+                    tgrc_rc_id=sa.select([db.recentchanges.c.rc_id]) \
+                                    .where(db.recentchanges.c.rc_logid == sa.bindparam("b_log_id")),
+                    tgrc_tag_id=sa.select([db.tag.c.tag_id]) \
+                                    .where(db.tag.c.tag_name == sa.bindparam("b_tag_name"))) \
+                    .on_conflict_do_nothing(),
+            ("delete", "tagged_logevent"):
+                db.tagged_logevent.delete() \
+                    .where(sa.and_(db.tagged_logevent.c.tgle_log_id == sa.bindparam("b_log_id"),
+                                   db.tagged_logevent.c.tgle_tag_id == sa.select([db.tag.c.tag_id]) \
+                                            .where(db.tag.c.tag_name == sa.bindparam("b_tag_name")))),
+            ("delete", "tagged_recentchange"):
+                db.tagged_recentchange.delete() \
+                    .where(sa.and_(db.tagged_recentchange.c.tgrc_rc_id == sa.select([db.recentchanges.c.rc_id]) \
+                                            .where(db.recentchanges.c.rc_logid == sa.bindparam("b_log_id")),
+                                   db.tagged_recentchange.c.tgrc_tag_id == sa.select([db.tag.c.tag_id]) \
+                                            .where(db.tag.c.tag_name == sa.bindparam("b_tag_name")))),
+            ("update", "log_deleted"):
+                db.logging.update() \
+                    .where(db.logging.c.log_id == sa.bindparam("b_log_id")),
         }
 
         self.le_params = {
             "list": "logevents",
-            "leprop": "title|ids|type|user|userid|timestamp|comment|details",
+            "leprop": "title|ids|type|user|userid|timestamp|comment|details|tags",
             "lelimit": "max",
         }
 
     def gen_inserts_from_logevent(self, logevent):
-        title = Title(self.api, logevent["title"])
+        title = self.db.Title(logevent["title"])
 
         log_deleted = 0
         if "actionhidden" in logevent:
@@ -51,6 +77,7 @@ class GrabberLogging(Grabber):
             "log_type": logevent["type"],
             "log_action": logevent["action"],
             "log_timestamp": logevent["timestamp"],
+            # This assumes that anonymous users can't create log events, so all "0" from the API are from deleted users
             "log_user": value_or_none(logevent["userid"]),
             "log_user_text": logevent["user"],
             "log_namespace": logevent["ns"],
@@ -64,17 +91,78 @@ class GrabberLogging(Grabber):
         }
         yield self.sql["insert", "logging"], db_entry
 
+        for tag_name in logevent.get("tags", []):
+            db_entry = {
+                "b_log_id": logevent["logid"],
+                "b_tag_name": tag_name,
+            }
+            yield self.sql["insert", "tagged_logevent"], db_entry
+
     def gen_insert(self):
         for logevent in self.api.list(self.le_params):
             yield from self.gen_inserts_from_logevent(logevent)
 
     def gen_update(self, since):
-        since_f = format_date(since)
         params = self.le_params.copy()
         params["ledir"] = "newer"
-        params["lestart"] = since_f
+        params["lestart"] = since
 
-        for logevent in self.api.list(params):
-            yield from self.gen_inserts_from_logevent(logevent)
+        deleted_logevents = {}
+        added_tags = {}
+        removed_tags = {}
 
-        # TODO: go through the new logevents and update log_deleted of previous logevents
+        for le in self.api.list(params):
+            yield from self.gen_inserts_from_logevent(le)
+
+            # save new deleted logevents
+            if le["type"] == "delete" and le["action"] == "event":
+                assert le["params"]["type"] == "logging"
+                for logid in le["params"]["ids"]:
+                    deleted_logevents[logid] = le["params"]["new"]["bitmask"]
+            # save added/removed tags
+            elif le["type"] == "tag" and le["action"] == "update":
+                # skip tags for revisions
+                if "logid" in le["params"]:
+                    _logid = le["params"]["logid"]
+                    _added = set(le["params"]["tagsAdded"])
+                    _removed = set(le["params"]["tagsRemoved"])
+                    assert _added & _removed == set()
+                    for _tag in _added:
+                        if _tag in removed_tags.get(_logid, set()):
+                            removed_tags[_logid].remove(_tag)
+                        # always keep the last action
+                        added_tags.setdefault(_logid, set())
+                        added_tags[_logid].add(_tag)
+                    for _tag in _removed:
+                        if _tag in added_tags.get(_logid, set()):
+                            added_tags[_logid].remove(_tag)
+                        # always keep the last action
+                        removed_tags.setdefault(_logid, set())
+                        removed_tags[_logid].add(_tag)
+
+        # update log_deleted
+        for logid, bitmask in deleted_logevents.items():
+            yield self.sql["update", "log_deleted"], {"b_log_id": logid, "log_deleted": bitmask}
+
+        # update tags
+        for logid, added in added_tags.items():
+            for tag in added:
+                db_entry = {
+                    "b_log_id": logid,
+                    "b_tag_name": tag,
+                }
+                yield self.sql["insert", "tagged_logevent"], db_entry
+                # check if it is a recent change and tag it as well
+                result = self.db.engine.execute(sa.select([
+                            sa.exists().where(self.db.recentchanges.c.rc_logid == logid)
+                        ]))
+                if result.fetchone()[0]:
+                    yield self.sql["insert", "tagged_recentchange"], db_entry
+        for logid, removed in removed_tags.items():
+            for tag in removed:
+                db_entry = {
+                    "b_log_id": logid,
+                    "b_tag_name": tag,
+                }
+                yield self.sql["delete", "tagged_logevent"], db_entry
+                yield self.sql["delete", "tagged_recentchange"], db_entry

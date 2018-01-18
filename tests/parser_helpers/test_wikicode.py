@@ -101,6 +101,30 @@ some other text.
         wikicode = mwparserfromhell.parse(snippet)
         self._do_test(wikicode, "[[link]]", expected)
 
+    def test_lineend_twolinks(self):
+        snippet = """\
+Some other text [[link1]][[link2]]
+Following sentence.
+"""
+        expected = """\
+Some other text [[link1]]
+Following sentence.
+"""
+        wikicode = mwparserfromhell.parse(snippet)
+        self._do_test(wikicode, "[[link2]]", expected)
+
+    def test_linestart_twolinks(self):
+        snippet = """\
+Another paragraph.
+[[link1]][[link2]] some other text.
+"""
+        expected = """\
+Another paragraph.
+[[link2]] some other text.
+"""
+        wikicode = mwparserfromhell.parse(snippet)
+        self._do_test(wikicode, "[[link1]]", expected)
+
     def test_multiple_nodes(self):
         snippet = "[[link1]][[link2]][[link3]]"
         wikicode = mwparserfromhell.parse(snippet)
@@ -110,14 +134,23 @@ some other text.
         wikicode = mwparserfromhell.parse(snippet)
         self._do_test(wikicode, "[[link3]]", "[[link1]][[link2]]")
 
+    def test_multiple_nodes_text(self):
+        snippet = "foo [[link1]][[link2]][[link3]] bar"
+        wikicode = mwparserfromhell.parse(snippet)
+        self._do_test(wikicode, "[[link1]]", "foo [[link2]][[link3]] bar")
+        wikicode = mwparserfromhell.parse(snippet)
+        self._do_test(wikicode, "[[link2]]", "foo [[link1]][[link3]] bar")
+        wikicode = mwparserfromhell.parse(snippet)
+        self._do_test(wikicode, "[[link3]]", "foo [[link1]][[link2]] bar")
+
     def test_multiple_nodes_spaces(self):
-        snippet = "[[link1]] [[link2]] [[link3]]"
+        snippet = "foo [[link1]] [[link2]] [[link3]] bar"
         wikicode = mwparserfromhell.parse(snippet)
-        self._do_test(wikicode, "[[link1]]", "[[link2]] [[link3]]")
+        self._do_test(wikicode, "[[link1]]", "foo [[link2]] [[link3]] bar")
         wikicode = mwparserfromhell.parse(snippet)
-        self._do_test(wikicode, "[[link2]]", "[[link1]] [[link3]]")
+        self._do_test(wikicode, "[[link2]]", "foo [[link1]] [[link3]] bar")
         wikicode = mwparserfromhell.parse(snippet)
-        self._do_test(wikicode, "[[link3]]", "[[link1]] [[link2]]")
+        self._do_test(wikicode, "[[link3]]", "foo [[link1]] [[link2]] bar")
 
     def test_multiple_nodes_newlines(self):
         snippet = "[[link1]]\n[[link2]]\n[[link3]]"
@@ -328,6 +361,12 @@ class test_ensure_flagged:
         link = wikicode.nodes[0]
         flag = ensure_flagged_by_template(wikicode, link, "bar", "2=param1", "1=param2")
         assert str(wikicode) == "[[foo]] {{bar|2=param1|1=param2}}"
+
+    def test_dead_link(self):
+        wikicode = mwparserfromhell.parse("[[foo]]{{Dead link|2000|01|01}}")
+        link = wikicode.nodes[0]
+        flag = ensure_flagged_by_template(wikicode, link, "Dead link", "2017", "2", "3", overwrite_parameters=False)
+        assert str(wikicode) == "[[foo]]{{Dead link|2000|01|01}}"
 
 class test_ensure_unflagged:
     def test_noop(self):

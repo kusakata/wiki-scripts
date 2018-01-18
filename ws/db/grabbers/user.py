@@ -2,18 +2,18 @@
 
 import logging
 
-from sqlalchemy import bindparam
+import sqlalchemy as sa
 
 import ws.utils
 from ws.client.api import ShortRecentChangesError
 from ws.db.mw_constants import implicit_groups
-import ws.db.selects.recentchanges as rc
+import ws.db.selects as selects
 
-from . import Grabber
+from .GrabberBase import *
 
 logger = logging.getLogger(__name__)
 
-class GrabberUsers(Grabber):
+class GrabberUsers(GrabberBase):
 
     # We never delete from the user table, otherwise FK constraints might kick in.
     # If we find out that MediaWiki sometimes deletes from the user table, it
@@ -23,29 +23,23 @@ class GrabberUsers(Grabber):
     def __init__(self, api, db):
         super().__init__(api, db)
 
+        ins_user = sa.dialects.postgresql.insert(db.user)
+        ins_user_groups = sa.dialects.postgresql.insert(db.user_groups)
+
         self.sql = {
             ("insert", "user"):
-                db.user.insert(
-                    on_conflict_constraint=[db.user.c.user_id],
-                    on_conflict_update=[
-                        db.user.c.user_name,
-                        db.user.c.user_registration,
-                        db.user.c.user_editcount,
-                    ]),
+                ins_user.on_conflict_do_update(
+                    index_elements=[db.user.c.user_id],
+                    set_={
+                        "user_name":         ins_user.excluded.user_name,
+                        "user_registration": ins_user.excluded.user_registration,
+                        "user_editcount":    ins_user.excluded.user_editcount,
+                    }),
             ("insert", "user_groups"):
-                # It would have been fine to use INSERT IGNORE here, but MySQL
-                # generates a warning for every ignored row.
-                db.user_groups.insert(
-                    on_conflict_constraint=[
-                        db.user_groups.c.ug_user,
-                        db.user_groups.c.ug_group
-                    ],
-                    on_conflict_update=[
-                        db.user_groups.c.ug_group
-                    ]),
+                ins_user_groups.on_conflict_do_nothing(),
             ("delete", "user_groups"):
                 db.user_groups.delete().where(
-                    db.user_groups.c.ug_user == bindparam("b_ug_user")),
+                    db.user_groups.c.ug_user == sa.bindparam("b_ug_user")),
         }
 
 
@@ -114,7 +108,6 @@ class GrabberUsers(Grabber):
     def gen_update(self, since):
         rcusers = self.get_rcusers(since)
         if rcusers:
-            logger.info("Fetching properties of {} possibly modified user accounts...".format(len(rcusers)))
             for chunk in ws.utils.iter_chunks(rcusers, self.api.max_ids_per_query):
                 list_params = {
                     "list": "users",
@@ -132,34 +125,23 @@ class GrabberUsers(Grabber):
         :param datetime.datetime since: timestamp of the last update
         :returns: a set of user names
         """
-        since_f = ws.utils.format_date(since)
         rcusers = set()
 
         # Items in the recentchanges table are periodically purged according to
         # http://www.mediawiki.org/wiki/Manual:$wgRCMaxAge
-        # By default the max age is 13 weeks: if a larger timespan is requested
+        # By default the max age is 90 days: if a larger timespan is requested
         # here, it's very important to warn that the changes are not available
-#        if self.api.oldest_recent_change > since:
-        if rc.oldest_recent_change(self.db) > since:
+        if selects.oldest_rc_timestamp(self.db) > since:
             raise ShortRecentChangesError()
 
-#        rc_params = {
-#            "action": "query",
-#            "list": "recentchanges",
-#            "rctype": "edit|new|log",
-#            "rcprop": "user|title|loginfo",
-#            "rclimit": "max",
-#            "rcdir": "newer",
-#            "rcstart": since_f,
-#        }
-#        for change in self.api.list(rc_params):
         rc_params = {
+            "list": "recentchanges",
             "type": {"edit", "new", "log"},
             "prop": {"user", "title", "loginfo"},
             "dir": "newer",
-            "start": since_f,
+            "start": since,
         }
-        for change in rc.list(self.db, rc_params):
+        for change in self.db.query(rc_params):
             # add the performer of the edit, newpage or log entry
             rcusers.add(change["user"])
 

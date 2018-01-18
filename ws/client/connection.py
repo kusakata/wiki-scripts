@@ -13,9 +13,10 @@ and making requests.
 import requests
 import http.cookiejar as cookielib
 import logging
+import copy
 
 from ws import __version__, __url__
-from ..utils import RateLimited
+from ..utils import RateLimited, parse_timestamps_in_struct, serialize_timestamps_in_struct
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +25,6 @@ __all__ = ["DEFAULT_UA", "Connection", "APIWrongAction", "APIJsonError", "APIErr
 DEFAULT_UA = "wiki-scripts/{version} ({url})".format(version=__version__, url=__url__)
 
 GET_ACTIONS = {
-    'abusefiltercheckmatch',
-    'abusefilterchecksyntax',
-    'abusefilterevalexpression',
     'checktoken',
     'clearhasmsg',
     'compare',
@@ -36,7 +34,6 @@ GET_ACTIONS = {
     'feedwatchlist',
     'help',
     'logout',
-    'mobileview',
     'opensearch',
     'paraminfo',
     'parse',
@@ -45,7 +42,6 @@ GET_ACTIONS = {
     'tokens',
 }
 POST_ACTIONS = {
-    'abusefilterunblockautopromote',
     'block',
     'changeauthenticationdata',
     'clientlogin',
@@ -56,7 +52,6 @@ POST_ACTIONS = {
     'emailuser',
     'filerevert',
     'imagerotate',
-    'import',
     'linkaccount',
     'login',
     'managetags',
@@ -71,16 +66,21 @@ POST_ACTIONS = {
     'revisiondelete',
     'rollback',
     'setnotificationtimestamp',
+    'setpagelanguage',  # MW 1.29
     'stashedit',
     'tag',
     'unblock',
     'undelete',
     'unlinkaccount',
-    'upload',
     'userrights',
+    'validatepassword',  # MW 1.29
     'watch',
 }
-API_ACTIONS = GET_ACTIONS | POST_ACTIONS
+MULTIPART_FORM_DATA = {
+    'import': {'xml'},
+    'upload': {'file', 'chunk'},
+}
+API_ACTIONS = GET_ACTIONS | POST_ACTIONS | set(MULTIPART_FORM_DATA.keys())
 
 class Connection:
     """
@@ -263,8 +263,18 @@ class Connection:
         if action == "help":
             params["wrap"] = "1"
 
+        # serialize timestamps
+        params = copy.deepcopy(params)
+        serialize_timestamps_in_struct(params)
+
         # select HTTP method and call the API
-        if action in POST_ACTIONS:
+        if action in MULTIPART_FORM_DATA:
+            # parameters specified in MULTIPART_FORM_DATA have to be uploaded as "files"
+            files = dict((k, v) for k, v in params.items() if k in MULTIPART_FORM_DATA[action])
+            for k in files:
+                del params[k]
+            result = self.request("POST", self.api_url, data=params, files=files)
+        elif action in POST_ACTIONS:
             # passing `params` to `data` will cause form-encoding to take place,
             # which is necessary when editing pages longer than 8000 characters
             result = self.request("POST", self.api_url, data=params)
@@ -286,6 +296,9 @@ class Connection:
             for warning in result["warnings"].values():
                 msg += "\n* {}".format(warning["*"])
             logger.warning(msg)
+
+        # parse timestamps
+        parse_timestamps_in_struct(result)
 
         if expand_result is True:
             if action in result:

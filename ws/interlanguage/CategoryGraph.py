@@ -4,7 +4,6 @@ import copy
 import logging
 
 import ws.ArchWiki.lang as lang
-from ws.parser_helpers.title import Title
 
 
 logger = logging.getLogger(__name__)
@@ -155,8 +154,8 @@ class CategoryGraph:
         yield lval, rval
 
     def create_category(self, category):
-        title = Title(self.api, category)
-        if title.iwprefix or title.namespace != "カテゴリ":
+        title = self.api.Title(category)
+        if title.iwprefix or title.namespace != "Category":
             raise ValueError("Invalid category name: [[{}]]".format(category))
         # normalize name
         category = title.fullpagename
@@ -194,5 +193,8 @@ class CategoryGraph:
             self.create_category(p)
 
     def init_wanted_categories(self):
+        logger.warning("Skipping init_wanted_categories because the WantedCategories query page is broken, see https://wiki.archlinux.org/index.php?title=Talk:Init&diff=500419&oldid=489777")
+        return
+
         for page in self.api.list(list="querypage", qppage="Wantedcategories", qplimit="max"):
             self.create_category(page["title"])

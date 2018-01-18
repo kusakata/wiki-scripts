@@ -12,6 +12,8 @@ import hashlib
 import datetime
 import logging
 
+from ws.utils import parse_timestamps_in_struct, DatetimeEncoder, datetime_parser
+
 logger = logging.getLogger(__name__)
 
 def md5sum(bytes_):
@@ -90,7 +92,9 @@ class CacheDb:
             else:
                 self.meta["md5"] = md5_new
 
-            self.data = json.loads(s.decode("utf-8"))
+            self.data = json.loads(s.decode("utf-8"), object_hook=datetime_parser)
+            # manual conversion is necessary only for migration
+            parse_timestamps_in_struct(self.data)
         else:
             self.init(key)
 
@@ -112,7 +116,7 @@ class CacheDb:
                 raise e
 
         # update hashes
-        s = json.dumps(self.data).encode("utf-8")
+        s = json.dumps(self.data, cls=DatetimeEncoder).encode("utf-8")
         self.meta["md5"] = md5sum(s)
 
         # create copy and serialize timestamp (the type of the "real" timestamp
