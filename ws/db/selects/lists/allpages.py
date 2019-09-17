@@ -15,8 +15,8 @@ class AllPages(GeneratorBase):
     API_PREFIX = "ap"
     DB_PREFIX = "page_"
 
-    @staticmethod
-    def set_defaults(params):
+    @classmethod
+    def set_defaults(klass, params):
         params.setdefault("dir", "ascending")
         params.setdefault("namespace", 0)
         params.setdefault("filterredir", "all")
@@ -24,8 +24,8 @@ class AllPages(GeneratorBase):
         params.setdefault("prfiltercascade", "all")
 #        params.setdefault("filterlanglinks", "all")
 
-    @staticmethod
-    def sanitize_params(params):
+    @classmethod
+    def sanitize_params(klass, params):
         assert set(params) <= {"from", "to", "dir", "prefix", "namespace", "filterredir", "minsize", "maxsize", "prtype", "prlevel", "prexpiry", "prfiltercascade", "filterlanglinks", "limit", "continue"}
 
         # TODO: convert the 'from', 'to' and 'prefix' fields to the database canonical format
@@ -38,6 +38,9 @@ class AllPages(GeneratorBase):
         else:
             start = params.get("to")
             end = params.get("from")
+        # None is uncomparable
+        if start and end:
+            assert start < end
 
         assert params["filterredir"] in {"all", "redirects", "nonredirects"}
         if "minsize" in params:
@@ -55,13 +58,15 @@ class AllPages(GeneratorBase):
         assert params["prfiltercascade"] in {"all", "cascading", "noncascading"}
 #        assert params["filterlanglinks"] in {"all", "withlanglinks", "withoutlanglinks"}
 
-    def get_select(self, params):
+    def get_pageset(self, params):
         """
         .. note::
             Parameters ...TODO... require joins with other tables,
             so that information will not be present during mirroring.
         """
-        if {"filterlanglinks", "limit", "continue"} & set(params):
+        if {"filterlanglinks", "continue"} & set(params):
+            raise NotImplementedError
+        if "limit" in params and params["limit"] != "max":
             raise NotImplementedError
 
         page = self.db.page
@@ -106,6 +111,10 @@ class AllPages(GeneratorBase):
         if end:
             s = s.where(page.c.page_title <= end)
         s = s.where(page.c.page_namespace == params["namespace"])
+        if params["filterredir"] == "redirects":
+            s = s.where(page.c.page_is_redirect == True)
+        if params["filterredir"] == "nonredirects":
+            s = s.where(page.c.page_is_redirect == False)
 
         # order by
         if params["dir"] == "ascending":
@@ -113,42 +122,13 @@ class AllPages(GeneratorBase):
         else:
             s = s.order_by(page.c.page_title.desc())
 
-        return s
+        return s, tail
 
-    def get_pageset(self, titles=None, pageids=None):
-        """
-        :param list titles: list of :py:class:`ws.parser_helpers.title.Title` objects
-        :param list pageids: list of :py:obj:`int` objects
-        """
-        assert titles is not None or pageids is not None
-        assert titles is None or pageids is None
+    def get_select(self, params):
+        return self.get_pageset(params)[0]
 
-        # join to get the namespace prefix
-        page = self.db.page
-        nss = self.db.namespace_starname
-        tail = page.outerjoin(nss, page.c.page_namespace == nss.c.nss_id)
-
-        s = sa.select([page.c.page_id, page.c.page_namespace, page.c.page_title, nss.c.nss_name])
-        s = s.select_from(tail)
-
-        if titles is not None:
-            ns_title_pairs = [(t.namespacenumber, t.dbtitle()) for t in titles]
-            s = s.where(sa.tuple_(page.c.page_namespace, page.c.page_title).in_(ns_title_pairs))
-            s = s.order_by(page.c.page_namespace.asc(), page.c.page_title.asc())
-
-            ex = sa.select([page.c.page_namespace, page.c.page_title])
-            ex = ex.where(sa.tuple_(page.c.page_namespace, page.c.page_title).in_(ns_title_pairs))
-        elif pageids is not None:
-            s = s.where(page.c.page_id.in_(pageids))
-            s = s.order_by(page.c.page_id.asc())
-
-            ex = sa.select([page.c.page_id])
-            ex = ex.where(page.c.page_id.in_(pageids))
-
-        return s, ex
-
-    @staticmethod
-    def db_to_api(row):
+    @classmethod
+    def db_to_api(klass, row):
         flags = {
             "page_id": "pageid",
             "page_namespace": "ns",

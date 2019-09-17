@@ -8,26 +8,38 @@ class SelectBase:
     def __init__(self, db):
         self.db = db
 
-    @staticmethod
-    def set_defaults(params):
+    @classmethod
+    def set_defaults(klass, params):
         """
         Responsible for setting default values of the query parameters.
         """
         raise NotImplementedError
 
-    @staticmethod
-    def sanitize_params(params):
+    @classmethod
+    def sanitize_params(klass, params):
         """
         Responsible for raising :py:exc:`AssertionError` in case of wrong input.
         """
         raise NotImplementedError
 
-    @staticmethod
-    def db_to_api(row):
+    @classmethod
+    def db_to_api(klass, row):
         """
         Converts data from the database into the API format.
         """
         raise NotImplementedError
+
+    @classmethod
+    def filter_params(klass, params, *, generator=False):
+        new_params = {}
+        for key, value in params.items():
+            prefix = klass.API_PREFIX
+            if generator is True:
+                prefix = "g" + prefix
+            if key.startswith(prefix):
+                new_key = key[len(prefix):]
+                new_params[new_key] = value
+        return new_params
 
     def execute_sql(self, query, *, explain=False):
         if explain is True:
@@ -38,20 +50,3 @@ class SelectBase:
                 print(row[0])
 
         return self.db.engine.execute(query)
-
-    def list(self, params):
-        """
-        Generator which yields the results of the query.
-
-        :param dict params: query parameters
-        """
-        self.set_defaults(params)
-        self.sanitize_params(params)
-
-        s = self.get_select(params)
-
-        # TODO: some lists like allrevisions should group the results per page like MediaWiki
-        result = self.execute_sql(s)
-        for row in result:
-            yield self.db_to_api(row)
-        result.close()

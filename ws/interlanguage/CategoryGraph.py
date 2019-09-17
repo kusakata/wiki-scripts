@@ -44,7 +44,7 @@ class MyIterator(object):
 
     def __next__(self):
         if self._exhausted:
-            raise StopIteration
+            return
         # FIXME: workaround for strange behaviour of lists inside tuples -> investigate
         next_item = copy.deepcopy(self._next_item)
         self._cache_next_item()
@@ -129,6 +129,9 @@ class CategoryGraph:
                 yield lval, rval
                 lval = next(lgen)
                 rval = next(rgen)
+                # avoid infinite loop if both generators get to the end in the inner loop
+                if lval is None and rval is None:
+                    break
             while cmp_tuples(lval, rval) > 0:
                 yield None, rval
                 rval = next(rgen)
@@ -193,8 +196,5 @@ class CategoryGraph:
             self.create_category(p)
 
     def init_wanted_categories(self):
-        logger.warning("Skipping init_wanted_categories because the WantedCategories query page is broken, see https://wiki.archlinux.org/index.php?title=Talk:Init&diff=500419&oldid=489777")
-        return
-
         for page in self.api.list(list="querypage", qppage="Wantedcategories", qplimit="max"):
             self.create_category(page["title"])

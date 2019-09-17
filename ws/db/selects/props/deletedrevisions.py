@@ -4,27 +4,23 @@ import sqlalchemy as sa
 
 import ws.db.mw_constants as mwconst
 
-from .GeneratorBase import GeneratorBase
+from ..SelectBase import SelectBase
 
-__all__ = ["AllDeletedRevisions"]
+__all__ = ["DeletedRevisions"]
 
-class AllDeletedRevisions(GeneratorBase):
+class DeletedRevisions(SelectBase):
 
-    API_PREFIX = "arv"
-    DB_PREFIX = "rev_"
+    API_PREFIX = "drv"
+    DB_PREFIX = "ar_"
 
-    @staticmethod
-    def set_defaults(params):
+    @classmethod
+    def set_defaults(klass, params):
         params.setdefault("dir", "older")
         params.setdefault("prop", {"timestamp", "ids", "flags", "comment", "user"})
 
-    @staticmethod
-    def sanitize_params(params):
-        # MW incompatibility: parameters related to content parsing are not supported (they are deprecated anyway)
-        assert set(params) <= {"start", "end", "dir", "namespace", "user", "excludeuser", "prop", "limit", "continue",
-                               "section", "generatetitles",
-                               "from", "to", "prefix", "tag"}  # these four are in addition to list=allrevisions
-
+    # shared with lists.AllDeletedRevisions
+    @classmethod
+    def sanitize_common_params(klass, params):
         # sanitize timestamp limits
         assert params["dir"] in {"newer", "older"}
         if params["dir"] == "older":
@@ -42,47 +38,51 @@ class AllDeletedRevisions(GeneratorBase):
         # MW incompatibility: "parsedcomment" and "parsetree" props are not supported
         assert params["prop"] <= {"user", "userid", "comment", "flags", "timestamp", "ids", "size", "sha1", "tags", "content", "contentmodel"}
 
-    def get_select(self, params):
-        """
-        .. note::
-            Parameters ...TODO... require joins with other tables,
-            so that information will not be present during mirroring.
-        """
-        if {"section", "generatetitles", "limit", "continue", "prefix"} & set(params):
-            raise NotImplementedError
+    @classmethod
+    def sanitize_params(klass, params):
+        # MW incompatibility: parameters related to content parsing are not supported (they are deprecated anyway)
+        assert set(params) <= {"start", "end", "dir", "user", "excludeuser", "prop", "limit", "continue",
+                               "section", "generatetitles", "tag"}
+        klass.sanitize_common_params(params)
 
+    # prop-specific methods
+    # TODO: create an abstract class which specifies them
+
+    def join_with_pageset(self, pageset):
         ar = self.db.archive
-        nss = self.db.namespace_starname
-        page = self.db.page
-        tail = ar.join(nss, ar.c.ar_namespace == nss.c.nss_id)
-        s = sa.select([ar.c.ar_page_id, ar.c.ar_namespace, ar.c.ar_title, nss.c.nss_name, ar.c.ar_deleted])
+        # TODO: this makes sense only for non-existing pages, so the pageset should be aliased to "page" in SQL or we should use bound parameters
+        return ar.outerjoin(pageset, (ar.c.ar_namespace == page.c.page_namespace) &
+                                     (ar.c.ar_title == page.c.page_title))
+
+    def get_select_prop(self, s, tail, params):
+        ar = self.db.archive
 
         prop = params["prop"]
         if "user" in prop:
-            s.append_column(ar.c.ar_user_text)
+            s = s.column(ar.c.ar_user_text)
         if "userid" in prop:
-            s.append_column(ar.c.ar_user)
+            s = s.column(ar.c.ar_user)
         if "comment" in prop:
-            s.append_column(ar.c.ar_comment)
+            s = s.column(ar.c.ar_comment)
         if "flags" in prop:
-            s.append_column(ar.c.ar_minor_edit)
+            s = s.column(ar.c.ar_minor_edit)
         if "timestamp" in prop:
-            s.append_column(ar.c.ar_timestamp)
+            s = s.column(ar.c.ar_timestamp)
         if "ids" in prop:
-            s.append_column(ar.c.ar_rev_id)
-            s.append_column(ar.c.ar_parent_id)
+            s = s.column(ar.c.ar_rev_id)
+            s = s.column(ar.c.ar_parent_id)
         if "size" in prop:
-            s.append_column(ar.c.ar_len)
+            s = s.column(ar.c.ar_len)
         if "sha1" in prop:
-            s.append_column(ar.c.ar_sha1)
+            s = s.column(ar.c.ar_sha1)
         if "contentmodel" in prop:
-            s.append_column(ar.c.ar_content_model)
-            s.append_column(ar.c.ar_content_format)
+            s = s.column(ar.c.ar_content_model)
+            s = s.column(ar.c.ar_content_format)
 
         # joins
         if "content" in prop:
             tail = tail.outerjoin(self.db.text, ar.c.ar_text_id == self.db.text.c.old_id)
-            s.append_column(self.db.text.c.old_text)
+            s = s.column(self.db.text.c.old_text)
         if "tags" in prop:
             tag = self.db.tag
             tgar = self.db.tagged_archived_revision
@@ -95,13 +95,12 @@ class AllDeletedRevisions(GeneratorBase):
                             .group_by(tgar.c.tgar_rev_id) \
                             .cte("tag_names")
             tail = tail.outerjoin(tag_names, ar.c.ar_rev_id == tag_names.c.tgar_rev_id)
-            s.append_column(tag_names.c.tag_names)
+            s = s.column(tag_names.c.tag_names)
         if "tag" in params:
             tag = self.db.tag
             tgar = self.db.tagged_archived_revision
             tail = tail.join(tgar, ar.c.ar_rev_id == tgar.c.tgar_rev_id)
             s = s.where(tgar.c.tgar_tag_id == sa.select([tag.c.tag_id]).where(tag.c.tag_name == params["tag"]))
-        s = s.select_from(tail)
 
         # restrictions
         if params["dir"] == "older":
@@ -118,9 +117,6 @@ class AllDeletedRevisions(GeneratorBase):
             s = s.where(ar.c.ar_title >= params["from"])
         if "end" in params:
             s = s.where(ar.c.ar_title <= params["to"])
-        if "namespace" in params:
-            # FIXME: namespace can be a '|'-delimited list
-            s = s.where(page.c.page_namespace == params["namespace"])
         if params.get("user"):
             s = s.where(ar.c.ar_user_text == params.get("user"))
         if params.get("excludeuser"):
@@ -132,10 +128,10 @@ class AllDeletedRevisions(GeneratorBase):
         else:
             s = s.order_by(ar.c.ar_timestamp.asc(), ar.c.ar_rev_id.asc())
 
-        return s
+        return s, tail
 
-    @staticmethod
-    def db_to_api(row):
+    @classmethod
+    def db_to_api(klass, row):
         flags = {
             "ar_rev_id": "revid",
             "ar_parent_id": "parentid",
@@ -194,3 +190,12 @@ class AllDeletedRevisions(GeneratorBase):
             api_entry["tags"].sort()
 
         return api_entry
+
+    @classmethod
+    def db_to_api_subentry(klass, page, row):
+        subentries = page.setdefault("deletedrevisions", [])
+        api_entry = klass.db_to_api(row)
+        del api_entry["pageid"]
+        del api_entry["ns"]
+        del api_entry["title"]
+        subentries.append(api_entry)

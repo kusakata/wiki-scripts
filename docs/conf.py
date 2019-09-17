@@ -62,7 +62,7 @@ def setup(app):
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3', None),
     'requests': ('http://docs.python-requests.org/en/latest/', None),
-    'mwparserfromhell': ('https://mwparserfromhell.readthedocs.org/en/latest/', None),
+    'mwparserfromhell': ('https://mwparserfromhell.readthedocs.io/en/latest/', None),
     'sqlalchemy': ('http://docs.sqlalchemy.org/en/latest/', None),
 }
 
@@ -80,7 +80,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = 'wiki-scripts'
-copyright = '2014-2016, Jakub Klinkovský'
+copyright = '2014-2018, Jakub Klinkovský'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -142,6 +142,7 @@ html_theme_options = {
     "github_user": "lahwaacz",
     "github_repo": "wiki-scripts",
     "github_banner": True,
+    "github_button": False,
     # wide layout
     "page_width": "95%",
     # use standard font families

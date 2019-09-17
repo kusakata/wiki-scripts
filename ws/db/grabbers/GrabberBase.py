@@ -29,14 +29,14 @@ class GrabberBase:
     def _set_sync_timestamp(self, timestamp, conn=None):
         """
         Set a last-sync timestamp for the grabber. Writes into the custom
-        ``ws_sync`` tyble.
+        ``ws_sync`` table.
 
         :param datetime.datetime timestamp: the new timestamp
         :param conn: an existing :py:obj:`sqlalchemy.engine.Connection` or
             :py:obj:`sqlalchemy.engine.Transaction` object to be re-used for
             execution of the SQL query
         """
-        ws_sync = self.db.metadata.tables["ws_sync"]
+        ws_sync = self.db.ws_sync
         ins = insert(ws_sync)
         ins = ins.on_conflict_do_update(
                     constraint=ws_sync.primary_key,
@@ -54,9 +54,9 @@ class GrabberBase:
     def _get_sync_timestamp(self):
         """
         Set a last-sync timestamp for the grabber. Reads from the custom
-        ``ws_sync`` tyble.
+        ``ws_sync`` table.
         """
-        ws_sync = self.db.metadata.tables["ws_sync"]
+        ws_sync = self.db.ws_sync
         sel = select([ws_sync.c.wss_timestamp]) \
               .where(ws_sync.c.wss_key == self.__class__.__name__)
 
@@ -128,7 +128,7 @@ class GrabberBase:
             gen = self.gen_update(since)
             self._execute(gen, sync_timestamp)
         except ShortRecentChangesError:
-            logger.warning("The recent changes table on the wiki has been recently purged, starting from scratch.")
+            logger.warning("The recent changes table on the wiki has been recently purged, so {} must start from scratch.".format(self.__class__.__name__))
             self.insert()
 
     def _execute(self, gen, sync_timestamp):

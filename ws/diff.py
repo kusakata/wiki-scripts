@@ -32,6 +32,15 @@ def diff_highlighted(old, new, fromfile="", tofile="", fromfiledate="", tofileda
     :param tofiledate: new file timestamp (used as meta data to format diff header)
     :returns: diff formatted with ANSI color sequences
     """
+    # Wikicode -> str
+    new = str(new)
+
+    # normalize line breaks at the end
+    if not old.endswith("\n"):
+        old += "\n"
+    if not new.endswith("\n"):
+        new += "\n"
+
     if _has_wikeddiff is True:
         # get diff fragments
         config = WikEdDiff.WikEdDiffConfig()

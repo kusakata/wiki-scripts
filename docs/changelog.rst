@@ -7,6 +7,29 @@ Version 1.3
 Unreleased
 (`changes <https://github.com/lahwaacz/wiki-scripts/compare/1.2...master>`__)
 
+- SQL database:
+    - Implemented a subset of MediaWiki API querie. Lists: ``allpages``,
+      ``alldeletedrevisions``, ``allrevisions``, ``logevents``,
+      ``protectedtitles``, ``recentchanges``; props: ``deletedrevisions``,
+      ``revisions``, ``pageprops``, ``info``; including ``generator``,
+      ``titles`` and ``pageids`` parameters. See the GitHub issue for more
+      information: https://github.com/lahwaacz/wiki-scripts/issues/35.
+    - Implemented synchronization of the latest revisions contents.
+    - Fixed many bugs in the synchronization process.
+    - Implemented custom parser cache, see the GitHub issue for more
+      information: https://github.com/lahwaacz/wiki-scripts/issues/42
+- Removed :py:mod:`ws.cache.LatestRevisions` module. Scripts use the SQL
+  database for caching.
+- Merged several smaller scripts into ``list-problems.py``.
+- Implemented the :py:meth:`ws.client.api.API.move` method to rename pages on
+  the wiki.
+- Implemented recursive template expansion using :py:mod:`mwparserfromhell` and
+  the SQL database. See :py:mod:`ws.parser_helpers.template_expansion`.
+- Implemented a regex-based function to check if a page is a redirect
+  (:py:func:`ws.parser_helpers.wikicode.is_redirect`).
+- Fixed handling of relative links and leading colons in the :py:class:`Title
+  <ws.parser_helpers.title.Title>` class.
+
 Version 1.2
 -----------
 

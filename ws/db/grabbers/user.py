@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import logging
+import datetime
 
 import sqlalchemy as sa
 
@@ -59,10 +60,19 @@ class GrabberUsers(GrabberBase):
             yield self.sql["insert", "user"], db_entry
 
             extra_groups = set(user["groups"]) - implicit_groups
+            # FIXME: list=allusers does not have a groupmemberships parameter: https://phabricator.wikimedia.org/T218489
+            if "groupmemberships" in user:
+                expirations = dict((gm["group"], gm["expiry"]) for gm in user["groupmemberships"])
+            else:
+                expirations = dict()
             for group in extra_groups:
+                expiry = expirations.get(group)
+                if expiry == datetime.datetime.max:
+                    expiry = None
                 db_entry = {
                     "ug_user": user["userid"],
                     "ug_group": group,
+                    "ug_expiry": expiry,
                 }
                 yield self.sql["insert", "user_groups"], db_entry
 
@@ -93,13 +103,19 @@ class GrabberUsers(GrabberBase):
         dummy = {
             "user_id": 0,
             "user_name": "__wiki_scripts_dummy_user__",
+            # IMPORTANT: Make sure to specify `None`s here, because the used columns are determined from
+            # the first value in a bulk insert. So if they were no specified here, server default would
+            # apply even if the following rows specified these columns.
+            "user_registration": None,
+            "user_editcount": None,
         }
         yield self.sql["insert", "user"], dummy
 
         list_params = {
             "list": "allusers",
             "aulimit": "max",
-            "auprop": "groups|editcount|registration",
+            # "groups" is needed just to catch autoconfirmed
+            "auprop": "groups|groupmemberships|editcount|registration",
         }
         for user in self.api.list(list_params):
             yield from self.gen_inserts_from_user(user)
@@ -112,10 +128,17 @@ class GrabberUsers(GrabberBase):
                 list_params = {
                     "list": "users",
                     "ususers": "|".join(chunk),
-                    "usprop": "groups|editcount|registration",
+                    # "groups" is needed just to catch autoconfirmed
+                    "usprop": "groups|groupmemberships|editcount|registration",
                 }
                 for user in self.api.list(list_params):
                     yield from self.gen_inserts_from_user(user)
+                    yield from self.gen_deletes_from_user(user)
+
+        # delete expired group memberships
+        yield self.db.user_groups.delete().where(
+                        self.db.user_groups.c.ug_expiry < datetime.datetime.utcnow()
+                    )
 
 
     def get_rcusers(self, since):
@@ -136,10 +159,10 @@ class GrabberUsers(GrabberBase):
 
         rc_params = {
             "list": "recentchanges",
-            "type": {"edit", "new", "log"},
-            "prop": {"user", "title", "loginfo"},
-            "dir": "newer",
-            "start": since,
+            "rctype": {"edit", "new", "log"},
+            "rcprop": {"user", "title", "loginfo"},
+            "rcdir": "newer",
+            "rcstart": since,
         }
         for change in self.db.query(rc_params):
             # add the performer of the edit, newpage or log entry

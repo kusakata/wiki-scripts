@@ -15,7 +15,7 @@ import os.path
 import sqlalchemy as sa
 import alembic.config
 
-from . import schema, selects, grabbers
+from . import schema, selects, grabbers, parser_cache
 from ..parser_helpers.title import Context, Title
 
 class Database:
@@ -92,6 +92,10 @@ class Database:
             contains the arguments set by :py:meth:`Connection.set_argparser`.
         :returns: an instance of :py:class:`Connection`
         """
+        # PostgreSQL defaults to dbname equal to the username, which may not be intended
+        if args.db_name is None:
+            raise ValueError("Cannot create database connection: db_name cannot be None")
+
         # The format is basically "{dialect}+{driver}://{username}:{password}@{host}:{port}/{database}?{params}",
         # but the URL class is suitable for omitting empty defaults.
         url = sa.engine.url.URL("{}+{}".format(args.db_dialect, args.db_driver),
@@ -120,7 +124,18 @@ class Database:
         :param ws.client.api.API api: interface to the remote MediaWiki instance
         :param bool with_content: whether to synchronize the content of all revisions
         """
-        return grabbers.synchronize(self, api, with_content=with_content)
+        grabbers.synchronize(self, api, with_content=with_content)
+
+    def sync_latest_revisions_content(self, api):
+        """
+        Sync the content of the latest revisions of all pages on the wiki.
+
+        Note that the method :py:meth:`.sync_with_api` should be called prior to
+        calling this method.
+
+        :param ws.client.api.API api: interface to the remote MediaWiki instance
+        """
+        grabbers.GrabberRevisions(api, self).sync_latest_revisions_content()
 
     def query(self, *args, **kwargs):
         """
@@ -145,6 +160,17 @@ class Database:
         legaltitlechars = " %!\"$&'()*,\\-.\\/0-9:;=?@A-Z\\\\^_`a-z~\\x80-\\xFF+"
         context = Context(iwmap, namespacenames, namespaces, legaltitlechars)
         return Title(context, title)
+
+    def update_parser_cache(self):
+        """
+        Update the parser cache tables.
+
+        Note that the methods :py:meth:`.sync_with_api` and
+        :py:meth:`.sync_latest_revisions_content` should be called prior to
+        calling this method.
+        """
+        cache = parser_cache.ParserCache(self)
+        cache.update()
 
 
 """

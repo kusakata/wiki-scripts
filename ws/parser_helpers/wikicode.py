@@ -6,9 +6,21 @@ import mwparserfromhell
 
 from .encodings import dotencode
 
-__all__ = ["strip_markup", "get_adjacent_node", "get_parent_wikicode", "remove_and_squash", "get_section_headings", "get_anchors", "ensure_flagged_by_template", "ensure_unflagged_by_template"]
+__all__ = [
+    "strip_markup", "get_adjacent_node", "get_parent_wikicode", "remove_and_squash",
+    "get_section_headings", "get_anchors", "ensure_flagged_by_template",
+    "ensure_unflagged_by_template", "is_redirect", "parented_ifilter",
+]
 
 def strip_markup(text, normalize=True, collapse=True):
+    """
+    Parses the given text and returns the text after stripping all MediaWiki
+    markup, leaving only the plain text.
+
+    :param normalize: passed to :py:func:`mwparserfromhell.wikicode.Wikicode.strip_code`
+    :param collapse: passed to :py:func:`mwparserfromhell.wikicode.Wikicode.strip_code`
+    :returns: :py:obj:`str`
+    """
     wikicode = mwparserfromhell.parse(text)
     return wikicode.strip_code(normalize, collapse)
 
@@ -106,6 +118,13 @@ def get_section_headings(text):
     Extracts section headings from given text. Custom regular expression is used
     instead of :py:mod:`mwparserfromhell` for performance reasons.
 
+    .. note::
+        Known issues:
+
+        - templates are not handled (use
+          :py:func:`ws.parser_helpers.template_expansion.expand_templates`
+          prior to calling this function)
+
     :param str text: content of the wiki page
     :returns: list of section headings (without the ``=`` marks)
     """
@@ -121,10 +140,11 @@ def get_anchors(headings, pretty=False, suffix_sep="_"):
     .. note::
         Known issues:
 
-        - templates are always fully stripped (doing this right requires
-          template expansion)
-        - all tags are always stripped, even invalid tags (``mwparserfromhell``
-          is not that configurable)
+        - templates are not handled (call
+          :py:func:`ws.parser_helpers.template_expansion.expand_templates`
+          on the wikitext before extracting section headings)
+        - all tags are always stripped, even invalid tags
+          (:py:mod:`mwparserfromhell` is not that configurable)
         - if ``pretty`` is ``True``, tags escaped with <nowiki> in the input
           are not encoded in the output
 
@@ -207,3 +227,49 @@ def ensure_unflagged_by_template(wikicode, node, template_name):
 
     if isinstance(adjacent, mwparserfromhell.nodes.Template) and adjacent.name.matches(template_name):
         remove_and_squash(wikicode, adjacent)
+
+def is_redirect(text, *, full_match=False):
+    """
+    Checks if the text represents a MediaWiki `redirect page`_.
+
+    :param bool full_match:
+        Restricts the behaviour to return ``True`` only for pages which do not
+        contain anything else but the redirect line.
+
+    .. _`redirect page`: https://www.mediawiki.org/wiki/Help:Redirects
+    """
+    if full_match is True:
+        f = re.fullmatch
+    else:
+        f = re.match
+    match = f(r"#redirect\s*:?\s*\[\[[^[\]{}]+\]\]", text.strip(), flags=re.MULTILINE | re.IGNORECASE)
+    return bool(match)
+
+from itertools import chain
+
+# default flags copied from mwparserfromhell
+FLAGS = re.IGNORECASE | re.DOTALL | re.UNICODE
+def parented_ifilter(wikicode, recursive=True, matches=None, flags=FLAGS,
+                     forcetype=None):
+    """Iterate over nodes and their corresponding parents.
+
+    The arguments are interpreted as for :meth:`ifilter`. For each tuple
+    ``(parent, node)`` yielded by this method, ``parent`` is the direct
+    parent wikicode of ``node``.
+
+    The method is intended for performance optimization by avoiding expensive
+    search e.g. in the ``replace`` method. See the :py:mod:`mwparserfromhell`
+    issue for details: https://github.com/earwig/mwparserfromhell/issues/195
+    """
+    match = wikicode._build_matcher(matches, flags)
+    if recursive:
+        restrict = forcetype if recursive == wikicode.RECURSE_OTHERS else None
+        def getter(node):
+            for parent, ch in wikicode._get_children(node, restrict=restrict, contexts=True, parent=wikicode):
+                yield (parent, ch)
+        inodes = chain(*(getter(n) for n in wikicode.nodes))
+    else:
+        inodes = ((wikicode, node) for node in wikicode.nodes)
+    for parent, node in inodes:
+        if (not forcetype or isinstance(node, forcetype)) and match(node):
+            yield (parent, node)

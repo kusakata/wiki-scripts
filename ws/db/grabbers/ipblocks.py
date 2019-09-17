@@ -102,17 +102,17 @@ class GrabberIPBlocks(GrabberBase):
         rcusers = set()
         le_params = {
             "list": "logevents",
-            "type": "block",
-            "prop": {"title"},
-            "dir": "newer",
-            "start": since,
+            "letype": "block",
+            "leprop": {"title"},
+            "ledir": "newer",
+            "lestart": since,
         }
         for logevent in self.db.query(le_params):
             # extract target user name
             username = logevent["title"].split(":", maxsplit=1)[1]
             rcusers.add(username)
         if not rcusers:
-            raise StopIteration
+            return
 
         # a mapping of ipb_address to set of ipb_id keys
         rcblocks = {}

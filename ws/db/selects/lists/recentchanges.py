@@ -13,14 +13,14 @@ class RecentChanges(GeneratorBase):
     API_PREFIX = "rc"
     DB_PREFIX = "rc_"
 
-    @staticmethod
-    def set_defaults(params):
+    @classmethod
+    def set_defaults(klass, params):
         params.setdefault("dir", "older")
         params.setdefault("prop", {"title", "timestamp", "ids"})
         params.setdefault("type", {"edit", "new", "log"})
 
-    @staticmethod
-    def sanitize_params(params):
+    @classmethod
+    def sanitize_params(klass, params):
         assert set(params) <= {"start", "end", "dir", "namespace", "user", "excludeuser", "tag", "prop", "show", "type", "toponly", "limit", "continue"}
 
         # sanitize timestamp limits
@@ -63,7 +63,9 @@ class RecentChanges(GeneratorBase):
             Also ``prop=title`` requires join with the ``namespace_starname`` table
             but that must be synchronized first anyway.
         """
-        if {"limit", "continue"} & set(params):
+        if {"continue"} & set(params):
+            raise NotImplementedError
+        if "limit" in params and params["limit"] != "max":
             raise NotImplementedError
 
         rc = self.db.recentchanges
@@ -191,8 +193,8 @@ class RecentChanges(GeneratorBase):
 
         return s
 
-    @staticmethod
-    def db_to_api(row):
+    @classmethod
+    def db_to_api(klass, row):
         flags = {
             "rc_id": "rcid",
             "rc_timestamp": "timestamp",

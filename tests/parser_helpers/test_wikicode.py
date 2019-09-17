@@ -386,3 +386,94 @@ class test_ensure_unflagged:
         link = wikicode.nodes[0]
         flag = ensure_unflagged_by_template(wikicode, link, "bar")
         assert str(wikicode) == "[[foo]]"
+
+class test_is_redirect:
+    redirects = [
+        # any number of spaces
+        "#redirect[[foo]]",
+        "#redirect [[foo]]",
+        "#redirect  [[foo]]",
+        # optional colon
+        "#redirect: [[foo]]",
+        "#redirect :[[foo]]",
+        "#redirect : [[foo]]",
+        # any capitalization
+        "#reDiRect  [[foo]]",
+        "#REDIRECT  [[foo]]",
+        # leading whitespace
+        "\n \n #redirect [[foo]]",
+        # any section and alternative text (which is ignored)
+        "#redirect [[foo#section]]",
+        "#redirect [[foo#section|ignored]]",
+        # templates
+        # FIXME: probably not possible to pair '{{' and '}}' with a regex
+#        "#redirect [[{{echo|Foo}}bar]]",
+    ]
+
+    nonredirects = [
+        "#redirect [[]]",
+        "#redirect [[]]",
+        "#redirect [[<nowikifoo]]",
+        "#redirect :: [[foo]]",
+        "#redirect [[foo{}]]",
+    ]
+
+    def test_redirects(self):
+        for text in self.redirects:
+            assert is_redirect(text, full_match=False)
+            assert is_redirect(text, full_match=True)
+            text += "\n"
+            assert is_redirect(text, full_match=False)
+            assert is_redirect(text, full_match=True)
+            text += "bar"
+            assert is_redirect(text, full_match=False)
+            assert not is_redirect(text, full_match=True)
+
+    def test_nonredirects(self):
+        for text in self.redirects:
+            assert not is_redirect("foo" + text, full_match=False)
+            assert not is_redirect("foo" + text, full_match=True)
+        for text in self.nonredirects:
+            assert not is_redirect("foo" + text, full_match=False)
+            assert not is_redirect("foo" + text, full_match=True)
+
+class test_parented_ifilter:
+    wikicode = mwparserfromhell.parse("""<span>
+            foo {{bar|some text and {{another|template}}}}
+            </span>
+            {{foo|bar}}
+            """)
+
+    def test_recursive(self):
+        nodes = []
+        for parent, node in parented_ifilter(self.wikicode,
+                                             recursive=True):
+            nodes.append(node)
+            assert parent.index(node) >= 0
+        assert nodes == self.wikicode.filter(recursive=True)
+
+    def test_nonrecursive(self):
+        nodes = []
+        for parent, node in parented_ifilter(self.wikicode,
+                                             recursive=False):
+            nodes.append(node)
+            assert parent.index(node) >= 0
+        assert nodes == self.wikicode.filter(recursive=False)
+
+    def test_recursive_templates(self):
+        templates = []
+        for parent, template in parented_ifilter(self.wikicode,
+                                                 forcetype=mwparserfromhell.nodes.template.Template,
+                                                 recursive=True):
+            templates.append(template)
+            assert parent.index(template) >= 0
+        assert templates == self.wikicode.filter_templates(recursive=True)
+
+    def test_nonrecursive_templates(self):
+        templates = []
+        for parent, template in parented_ifilter(self.wikicode,
+                                                 forcetype=mwparserfromhell.nodes.template.Template,
+                                                 recursive=False):
+            templates.append(template)
+            assert parent.index(template) >= 0
+        assert templates == self.wikicode.filter_templates(recursive=False)

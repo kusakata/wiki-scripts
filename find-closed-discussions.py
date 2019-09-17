@@ -1,27 +1,24 @@
 #! /usr/bin/env python3
 
-import re
-
 from ws.client import API
-import ws.cache
+from ws.db.database import Database
+from ws.utils.OrderedSet import OrderedSet
 
 def main(api, db):
+    db.sync_with_api(api)
+    db.sync_latest_revisions_content(api)
+    db.update_parser_cache()
+
     namespaces = ["1", "5", "11", "13", "15"]
-    talks = []
-    closed_talk_re = re.compile("^[=]+[ ]*<s>", flags=re.MULTILINE)
+    talks = OrderedSet()
     for ns in namespaces:
-        pages = db[ns]
-        for page in pages:
-            text = page["revisions"][0]["*"]
-            if re.search(closed_talk_re, text):
-                talks.append(page)
+        for page in db.query(generator="allpages", gapnamespace=ns, prop="sections", secprop={"title"}):
+            for section in page.get("sections", []):
+                if section["title"].startswith("<s>") and section["title"].endswith("</s>"):
+                    talks.add(page["title"])
 
-    # commit data to disk in case there were lazy updates
-    # TODO: check if there were actually some updates...
-    db.dump()
-
-    for page in talks:
-        print("* [[{}]]".format(page["title"]))
+    for talk in talks:
+        print("* [[{}]]".format(talk))
 
 if __name__ == "__main__":
     import ws.config
@@ -29,13 +26,14 @@ if __name__ == "__main__":
 
     argparser = ws.config.getArgParser(description="Find closed discussions")
     API.set_argparser(argparser)
+    Database.set_argparser(argparser)
+
     args = argparser.parse_args()
 
     # set up logging
     ws.logging.init(args)
 
     api = API.from_argparser(args)
-    # FIXME: except for this part, object_from_argparser could be used
-    db = ws.cache.LatestRevisionsText(api, args.cache_dir, autocommit=False)
+    db = Database.from_argparser(args)
 
     main(api, db)

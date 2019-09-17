@@ -52,7 +52,7 @@ class Statistics:
                     type=int, dest='us_days', metavar='N',
                     help='the time span in days (default: %(default)s)')
         usstats.add_argument('--us-min-tot-edits', action='store',
-                    default=5, type=int, dest='us_mintotedits', metavar='N',
+                    default=1000, type=int, dest='us_mintotedits', metavar='N',
                     help='minimum total edits for users with not enough '
                     'recent changes (default: %(default)s)')
         usstats.add_argument('--us-min-rec-edits', action='store',
@@ -220,7 +220,7 @@ class _UserStats:
 
     @classmethod
     def _format_groups(cls, groups):
-        fgroups = [cls.GRPTRANSL[group] for group in groups]
+        fgroups = [cls.GRPTRANSL[group](groups) for group in groups]
         # drop empty strings
         fgroups = list(filter(bool, fgroups))
         fgroups.sort()
@@ -230,7 +230,7 @@ class _UserStats:
         rows = []
 
         for user in self.db_userprops:
-            if "invalid" in user or "missing" in user:
+            if "invalid" in user or "missing" in user or "blockid" in user:
                 continue
             if user["editcount"] >= self.MINTOTEDITS or user["recenteditcount"] >= self.MINRECEDITS:
                 name = user["name"]
@@ -266,7 +266,7 @@ class _UserStats:
     def _compose_table(self, rows, majorusersN, activeusersN, totalusersN):
         newtext = (self.INTRO).format(majorusersN, self.MINTOTEDITS,
                                 activeusersN, self.MINRECEDITS,
-                                "",
+                                "edits" if self.MINRECEDITS > 1 else "edit",
                                 self.DAYS, self.db_userprops.firstdate,
                                 self.db_userprops.lastdate, totalusersN)
         newtext += Wikitable.assemble(self.FIELDS_FORMAT, rows)

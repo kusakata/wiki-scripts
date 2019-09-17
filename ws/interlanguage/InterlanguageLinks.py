@@ -282,7 +282,7 @@ class InterlanguageLinks:
         :param str title: title of the page
         :param str text: wikitext of the page
         :param langlinks: a sorted list of ``(tag, title)`` tuples as obtained
-                          from :py:meth:`self._get_langlinks`
+                          from :py:meth:`self.get_langlinks`
         :param weak_update:
             When ``True``, the langlinks present on the page are mixed with those
             suggested by ``family_titles``. This is necessary only when there are
@@ -301,7 +301,7 @@ class InterlanguageLinks:
         # (e.g. "cs:Some title" for title="Some title" and tag="cs")
         langlinks = ["[[{}:{}]]".format(tag, title) for tag, title in langlinks]
 
-        logger.info("Parsing '{}'...".format(title))
+        logger.info("Parsing page [[{}]] ...".format(title))
         wikicode = mwparserfromhell.parse(text)
         if weak_update is True:
             parent, magics, cats, langlinks = header.get_header_parts(wikicode, langlinks=langlinks, remove_from_parent=True)
@@ -375,3 +375,32 @@ class InterlanguageLinks:
             if lang.detect_language(title)[1] != lang.get_local_language() and len(langlinks) == 0:
                 orphans.append(title)
         return orphans
+
+    def _page_exists(self, title):
+        # self.allpages does not include redirects, but that's fine...
+        return canonicalize(title) in set(page["title"] for page in self.allpages)
+
+    def rename_non_english(self):
+        del self.allpages
+
+        # FIXME: starting with English pages is not very good:
+        # - some pages are omitted (e.g. when two pages link to the same English page, at least warning should be printed)
+        # - it suggests to move e.g. Xfce (Česky) to Xfwm (Česky) because multiple English pages link to it
+        # Therefore we limit it only to categories...
+        for page in self.allpages:
+            title = page["title"]
+            if lang.detect_language(title)[1] == "English" and title.startswith("Category:"):
+                langlinks = self.get_langlinks(title)
+                for tag, localized_title in langlinks:
+                    logger.info("Checking [[{}:{}]] for renaming...".format(tag, localized_title))
+                    if lang.is_internal_tag(tag) and localized_title != title:
+                        source = "{} ({})".format(localized_title, lang.langname_for_tag(tag))
+                        target = "{} ({})".format(title, lang.langname_for_tag(tag))
+                        if self._page_exists(target):
+                            logger.warning("Cannot move page [[{}]] to [[{}]]: target page already exists".format(source, target))
+                        else:
+                            # interactive mode is necessary because this assumes that all English pages are named correctly
+                            ans = ask_yesno("Move page [[{}]] to [[{}]]?".format(source, target))
+                            if ans is True:
+                                summary = "comply with [[Help:I18n#Page titles]] and match the title of the English page"
+                                self.api.move(source, target, summary)

@@ -120,7 +120,6 @@ class API(Connection):
             "rcprop": "ids",
             "rctype": "edit|new",
             "rclimit": "1",
-            "continue": "",  # needed only to silence stupid deprecation warning
         }
         recentchanges = self.call_api(params)["recentchanges"]
         if len(recentchanges) == 0:
@@ -146,7 +145,6 @@ class API(Connection):
             "rcprop": "timestamp",
             "rcdir": "newer",
             "rclimit": "1",
-            "continue": "",  # needed only to silence stupid deprecation warning
         }
         recentchanges = self.call_api(params)["recentchanges"]
         if len(recentchanges) == 0:
@@ -164,7 +162,6 @@ class API(Connection):
             "rcprop": "timestamp",
             "rcdir": "older",
             "rclimit": "1",
-            "continue": "",  # needed only to silence stupid deprecation warning
         }
         recentchanges = self.call_api(params)["recentchanges"]
         if len(recentchanges) == 0:
@@ -242,10 +239,11 @@ class API(Connection):
         exceeding the value of ``$wgAPIMaxResultSize``.
 
         Although there is an automated query continuation via
-        :py:meth:`query_continue`, the overlapping overlapping data is not
-        squashed automatically in order to avoid keeping big data in memory
-        (this is the point of API:Generators). As a result, a page may be
-        yielded multiple times. See :py:meth:`ws.cache.LatestRevisionsText.init`
+        :py:meth:`query_continue`, the overlapping data is not squashed
+        automatically in order to avoid keeping big data in memory (this is the
+        point of API:Generators). As a result, a page may be yielded multiple
+        times. For applications where this matters, see
+        :py:meth:`ws.interlanguage.InterlanguageLinks.InterlanguageLinks._get_allpages`
         for an example of proper handling of this case.
         """
         generator_ = kwargs.get("generator") if params is None else params.get("generator")
@@ -447,6 +445,50 @@ class API(Connection):
             return self.call_with_csrftoken(action="edit", title=title, md5=md5, text=text, summary=summary, createonly="1", **kwargs)
         except APIError as e:
             logger.error("Failed to create page [[{}]] due to APIError (code '{}': {})".format(title, e.server_response["code"], e.server_response["info"]))
+            raise
+
+    @RateLimited(1, 10)
+    def move(self, from_title, to_title, reason, *, movetalk=True, movesubpages=True, noredirect=False, **kwargs):
+        """
+        Interface to `API:Move`_. This method is rate-limited with the
+        :py:class:`@RateLimited <ws.utils.rate.RateLimited>` decorator to allow
+        1 call per 10 seconds.
+
+        :param str from_title: the original title of the page to be renamed
+        :param str to_title: the new title of the page to be renamed
+        :param str reason: reason for the rename
+        :param bool movetalk: rename the associated talk page, if it exists
+        :param bool subpages: rename subpages, if applicable
+        :param bool noredirect: don't create a redirect
+        :param kwargs: Additional query parameters, see `API:Move`_.
+
+        .. _`API:Move`: https://www.mediawiki.org/wiki/API:Move
+        """
+        kwargs["action"] = "move"
+        kwargs["from"] = from_title
+        kwargs["to"] = to_title
+        kwargs["reason"] = reason
+        if movetalk is True:
+            kwargs["movetalk"] = "true"
+        if movesubpages is True:
+            kwargs["movesubpages"] = "true"
+        if noredirect is True:
+            kwargs["noredirect"] = "true"
+
+        # check and apply tags
+        if "applychangetags" in self.user.rights and "wiki-scripts" in self.tags.applicable:
+            kwargs.setdefault("tags", [])
+            kwargs["tags"].append("wiki-scripts")
+        elif "applychangetags" not in self.user.rights and "tags" in kwargs:
+            logger.warning("Your account does not have the 'applychangetags' right, removing tags from the parameter list: {}".format(kwargs["tags"]))
+            del kwargs["tags"]
+
+        logger.info("Moving page [[{}]] to [[{}]] ...".format(from_title, to_title))
+
+        try:
+            return self.call_with_csrftoken(**kwargs)
+        except APIError as e:
+            logger.error("Failed to move page [[{}]] to [[{}]] due to APIError (code '{}': {})".format(from_title, to_title, e.server_response["code"], e.server_response["info"]))
             raise
 
 class LoginFailed(Exception):

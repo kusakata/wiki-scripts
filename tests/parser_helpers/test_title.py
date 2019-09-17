@@ -23,8 +23,6 @@ class test_canonicalize:
         assert result == expected
 
 
-# TODO: set pytest attribute?
-#@attr(speed="slow")
 class test_title():
     # keys: input, values: dictionary of expected attributes of the Title object
     titles = {
@@ -35,6 +33,7 @@ class test_title():
             "pagename": "Foo:Bar:Baz",
             "sectionname": "section",
             "fullpagename": "Foo:Bar:Baz",
+            "leading_colon": "",
         },
         "Talk:Foo": {
             "iwprefix": "",
@@ -42,6 +41,7 @@ class test_title():
             "pagename": "Foo",
             "sectionname": "",
             "fullpagename": "Talk:Foo",
+            "leading_colon": "",
         },
         "en:Main page": {
             "iwprefix": "en",
@@ -49,6 +49,7 @@ class test_title():
             "pagename": "Main page",
             "sectionname": "",
             "fullpagename": "en:Main page",
+            "leading_colon": "",
         },
         "en:help:style#section": {
             "iwprefix": "en",
@@ -56,6 +57,7 @@ class test_title():
             "pagename": "Style",
             "sectionname": "section",
             "fullpagename": "en:Help:Style",
+            "leading_colon": "",
         },
 
         # test stripping whitespace around colons
@@ -65,6 +67,7 @@ class test_title():
             "pagename": "Style",
             "sectionname": "section",
             "fullpagename": "en:Help:Style",
+            "leading_colon": "",
         },
 
         # test canonicalization
@@ -74,6 +77,7 @@ class test_title():
             "pagename": "Foo Bar",
             "sectionname": "",
             "fullpagename": "Help talk:Foo Bar",
+            "leading_colon": "",
         },
 
         # test anchor canonicalization
@@ -146,12 +150,21 @@ class test_title():
             "namespace": "",
             "pagename": "Foo:Bar",
             "fullpagename": "en:Foo:Bar",
+            "leading_colon": "",
+        },
+        "en:Talk:Bar": {
+            "iwprefix": "en",
+            "namespace": "Talk",
+            "pagename": "Bar",
+            "fullpagename": "en:Talk:Bar",
+            "leading_colon": "",
         },
         "wikipedia:Foo:Bar": {
             "iwprefix": "wikipedia",
-            "namespace": "Foo",
-            "pagename": "Bar",
+            "namespace": "",
+            "pagename": "Foo:Bar",
             "fullpagename": "wikipedia:Foo:Bar",
+            "leading_colon": "",
         },
 
         # test alternative namespace names
@@ -160,12 +173,14 @@ class test_title():
             "namespace": "Project",
             "pagename": "Foo",
             "fullpagename": "Project:Foo",
+            "leading_colon": "",
         },
         "Image:Foo": {
             "iwprefix": "",
             "namespace": "Image",
             "pagename": "Foo",
             "fullpagename": "Image:Foo",
+            "leading_colon": "",
         },
 
         # test colons
@@ -174,31 +189,37 @@ class test_title():
             "namespace": "Category",
             "pagename": "Foo",
             "fullpagename": "Category:Foo",
+            "leading_colon": ":",
         },
         "Foo::Bar": {
             "iwprefix": "",
             "namespace": "",
             "pagename": "Foo::Bar",
             "fullpagename": "Foo::Bar",
+            "leading_colon": "",
         },
-        "::Help:Style": {
-            "iwprefix": "",
-            "namespace": "Help",
-            "pagename": "Style",
-            "fullpagename": "Help:Style",
-        },
+        "::Help:Style": InvalidColonError,
+        "::wikipedia:Wikipedia:Manual of Style": InvalidColonError,
         "wikipedia::Wikipedia:Manual of Style": {
             "iwprefix": "wikipedia",
-            "namespace": "Wikipedia",
-            "pagename": "Manual of Style",
+            "namespace": "",
+            "pagename": "Wikipedia:Manual of Style",
             "fullpagename": "wikipedia:Wikipedia:Manual of Style",
+            "leading_colon": "",
         },
-        # even MediaWiki chokes on this one (rendered as plain text instead of link)
-        "Help::Style": {
-            "iwprefix": "",
-            "namespace": "Help",
-            "pagename": "Style",
-            "fullpagename": "Help:Style",
+        "wikipedia::Foo": {
+            "iwprefix": "wikipedia",
+            "namespace": "",
+            "pagename": "Foo",
+            "fullpagename": "wikipedia:Foo",
+            "leading_colon": "",
+        },
+        "Help::Style": InvalidColonError,
+        "Wikipedia:Code::Blocks": {
+            "iwprefix": "wikipedia",
+            "namespace": "",
+            "pagename": "Code::Blocks",
+            "fullpagename": "wikipedia:Code::Blocks",
         },
 
         # "double" namespace (important mainly for setters)
@@ -207,41 +228,51 @@ class test_title():
             "namespace": "Help",
             "pagename": "Help:Style",
             "fullpagename": "Help:Help:Style",
+            "leading_colon": "",
         },
         "en:en:Style": {
             "iwprefix": "en",
             "namespace": "",
             "pagename": "En:Style",
             "fullpagename": "en:En:Style",
+            "leading_colon": "",
         },
     }
 
     @pytest.mark.parametrize("src, expected", titles.items())
     def test_constructor(self, title_context, src, expected):
-        title = Title(title_context, src)
-        for attr, value in expected.items():
-            assert getattr(title, attr) == value
+        if type(expected) == type(Exception):
+            with pytest.raises(expected):
+                title = Title(title_context, src)
+        else:
+            title = Title(title_context, src)
+            for attr, value in expected.items():
+                assert getattr(title, attr) == value
 
     @pytest.mark.parametrize("src, expected", titles.items())
     def test_parse(self, title_context, src, expected):
-        title = Title(title_context, "")
-        title.parse(src)
-        for attr, value in expected.items():
-            assert getattr(title, attr) == value
+        if type(expected) == type(Exception):
+            title = Title(title_context, "")
+            with pytest.raises(expected):
+                title.parse(src)
+        else:
+            title = Title(title_context, "")
+            title.parse(src)
+            for attr, value in expected.items():
+                assert getattr(title, attr) == value
 
     @pytest.mark.parametrize("full, attrs", titles.items())
     def test_setters(self, title_context, full, attrs):
-        expected = Title(title_context, full)
-        title = Title(title_context, "")
-        title.iwprefix = attrs.get("iwprefix", "")
-        title.namespace = attrs.get("namespace", "")
-        title.pagename = attrs.get("pagename", "")
-        title.sectionname = attrs.get("sectionname", "")
-        assert title == expected
+        if type(attrs) != type(Exception):
+            expected = Title(title_context, full)
+            title = Title(title_context, "")
+            title.iwprefix = attrs.get("iwprefix", "")
+            title.namespace = attrs.get("namespace", "")
+            title.pagename = attrs.get("pagename", "")
+            title.sectionname = attrs.get("sectionname", "")
+            assert title == expected
 
 
-# TODO: set pytest attribute?
-#@attr(speed="slow")
 class test_title_setters():
     attributes = ["iwprefix", "namespace", "pagename", "sectionname"]
 
@@ -268,7 +299,7 @@ class test_title_setters():
     # `title.pagename = foo` checks it too
     def test_invalid_type_set_pagename(self, title):
         with pytest.raises(TypeError):
-            title.set_pagename(42)
+            title._set_pagename(42)
 
 
     def test_iwprefix(self, title):
@@ -348,8 +379,6 @@ class test_title_setters():
             title.namespace = "invalid namespace"
 
 
-# TODO: set pytest attribute?
-#@attr(speed="slow")
 class test_title_valid_chars:
     invalid_titles = [
         "Foo [bar]",
@@ -413,3 +442,69 @@ class test_title_valid_chars:
         title = Title(title_context, "")
         title.pagename = pagename
         assert title.pagename == pagename
+
+
+class test_dbtitle:
+    titles = [
+        ("main page", 0, "Main page"),
+        ("talk:main page", 1, "Main page"),
+        ("talk:main page", 0, "Talk:Main page"),
+    ]
+    titles_error = [
+        "Wikipedia:Main page",
+        "Wikipedia:Talk:Main page",
+        "Foo#Bar",
+    ]
+
+    @pytest.mark.parametrize("src", titles)
+    def test_dbtitle(self, title_context, src):
+        src_title, ns, expected = src
+        title = Title(title_context, src_title)
+        assert title.dbtitle(ns) == expected
+
+    @pytest.mark.parametrize("title", titles_error)
+    def test_dbtitle_error(self, title_context, title):
+        title = Title(title_context, title)
+        with pytest.raises(DatabaseTitleError):
+            title.dbtitle()
+
+
+class test_make_absolute:
+    titles = [
+        ("Talk:Foo", "Bar", "Talk:Foo"),
+        ("Wikipedia:Foo", "Bar", "wikipedia:Foo"),
+        ("#Bar", "Foo", "Foo#Bar"),
+        ("Foo#Bar", "Baz", "Foo#Bar"),
+        ("/Bar", "Foo", "Foo/Bar"),
+        ("Foo/Bar", "Baz", "Foo/Bar"),
+        (":/Foo", "Bar", "/Foo"),
+        ("../Foo", "Bar", "Foo"),  # MW incompatibility: MediaWiki does not allow "../" links from top-level pages
+        ("../Foo", "Bar/Baz", "Bar/Foo"),
+        ("../../Foo", "A/B/C", "A/Foo"),
+        ("/Foo/./Bar", "Baz", "Baz/Foo/Bar"),  # MW incompatibility: MediaWiki does not allow "/./" in the middle of a link
+    ]
+
+    @pytest.mark.parametrize("src", titles)
+    def test_make_absolute(self, title_context, src):
+        src_title, base_title, expected = src
+        title = Title(title_context, src_title)
+        result = title.make_absolute(base_title)
+        assert str(result) == expected
+        assert result is not title
+
+    def test_valueerror(self, title_context):
+        title = Title(title_context, "en:Foo")
+        with pytest.raises(ValueError):
+            title.make_absolute(title)
+
+
+def test_format(title_context):
+    title = Title(title_context, ":En:talk:main page#section")
+    assert title.format() == "Main page"
+    assert title.format(colon=True) == ":Main page"
+    assert title.format(iwprefix=True) == "en:Talk:Main page"
+    assert title.format(iwprefix=True, namespace=False) == "en:Talk:Main page"
+    assert title.format(namespace=True) == "Talk:Main page"
+    assert title.format(sectionname=True) == "Main page#section"
+    assert title.format(colon=True, iwprefix=True) == ":en:Talk:Main page"
+    assert title.format(colon=True, iwprefix=True, sectionname=True) == ":en:Talk:Main page#section"
