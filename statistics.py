@@ -154,7 +154,7 @@ class _UserStats:
     User statistics.
     """
     INTRO = """\n
-以下の表では {} 人の合計 {} 回以上編集を行ったユーザー、および {} 人の {} {} 回以上の編集を {} 日以内に行ったユーザー ({} 〜 {})、あわせて {} 人のユーザーを表示しています。
+以下の表では {} 人の合計 {} 回以上編集を行ったユーザー、および {} 人の {} 回以上の編集を {} 日以内に行ったユーザー ({} 〜 {})、あわせて {} 人のユーザーを表示しています。
 
 カラムの意味は以下の通りです:
 
@@ -266,7 +266,6 @@ class _UserStats:
     def _compose_table(self, rows, majorusersN, activeusersN, totalusersN):
         newtext = (self.INTRO).format(majorusersN, self.MINTOTEDITS,
                                 activeusersN, self.MINRECEDITS,
-                                "edits" if self.MINRECEDITS > 1 else "edit",
                                 self.DAYS, self.db_userprops.firstdate,
                                 self.db_userprops.lastdate, totalusersN)
         newtext += Wikitable.assemble(self.FIELDS_FORMAT, rows)
