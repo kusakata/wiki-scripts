@@ -173,14 +173,14 @@ class _UserStats:
                      "最長<br>記録", "現在<br>記録",
                      "平均<br>(合計)", "平均<br>(活動)")
     GRPTRANSL = {
-        "*": "",
-        "autoconfirmed": "",
-        "user": "",
-        "checkuser": "",
-        "bureaucrat": "[[ArchWiki:ビューロクラット|ビューロクラット]]",
-        "sysop": "[[ArchWiki:管理者|管理者]]",
-        "maintainer": "[[ArchWiki:メンテナ|メンテナ]]",
-        "bot": "[[ArchWiki:ボット|ボット]]",
+        "*": lambda groups: "",
+        "autoconfirmed": lambda groups: "",
+        "user": lambda groups: "",
+        "checkuser": lambda groups: "",
+        "bureaucrat": lambda groups: "[[ArchWiki:ビューロクラット|ビューロクラット]]",
+        "sysop": lambda groups: "[[ArchWiki:管理者|管理者]]",
+        "maintainer": lambda groups: "[[ArchWiki:メンテナ|メンテナ]]",
+        "bot": lambda groups: "[[ArchWiki:ボット|ボット]]",
     }
     STREAK_FORMAT = '<span title="{start} から {end} までの {length} 日間 (編集回数: {editcount})">{length}</span>'
     REGISTRATION_FORMAT = "%Y-%m-%d %H:%M:%S"
